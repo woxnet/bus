@@ -49,6 +49,10 @@ disp(report);
 assert(report.success);
 ```
 
+The IMU Brick 2.0 must run firmware 2.0.12 or newer. Firmware 2.0.11 has
+an upstream callback timing bug and produces about 30 Hz when 20 ms is
+configured; update it with Brick Viewer before attempting calibration.
+
 ## Installation calibration
 
 Only after successful hardware diagnostics, place the stationary bus on a

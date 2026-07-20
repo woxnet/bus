@@ -38,7 +38,7 @@ classdef MockImuBrick2 < handle
             obj.UID = config.uid;
             obj.Identity = struct('uid', config.uid, 'connectedUid', "0", ...
                 'position', "a", 'hardwareVersion', [1 0 0], ...
-                'firmwareVersion', [2 0 0], 'deviceIdentifier', 18);
+                'firmwareVersion', [2 0 15], 'deviceIdentifier', 18);
         end
 
         function data = readOnce(obj)

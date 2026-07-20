@@ -64,6 +64,15 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             testCase.verifyFalse(report.sensorFusionModeValid);
         end
 
+        function callbackPeriodBugFirmwareRejected(testCase)
+            imu = testCase.hardwareMock();
+            imu.Identity.firmwareVersion = [2 0 11];
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyFalse(report.firmwareVersionValid);
+            testCase.verifyEqual(report.callbackSamplesRead, 100);
+        end
+
         function callbackHasUniqueSequences(testCase)
             report = diagnoseImuBrick2(testCase.hardwareMock(), testCase.dependencies());
             testCase.verifyTrue(report.success);
