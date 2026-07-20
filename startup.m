@@ -2,7 +2,8 @@ projectRoot = fileparts(mfilename('fullpath'));
 jarFile = fullfile(projectRoot, 'lib', 'Tinkerforge.jar');
 
 if ~isfile(jarFile)
-    error('Не найден файл Tinkerforge.jar: %s', jarFile);
+    error('IMU:MissingTinkerforgeJar', ...
+        'Не найден файл Tinkerforge.jar: %s', jarFile);
 end
 
 dynamicJavaPath = javaclasspath('-dynamic');

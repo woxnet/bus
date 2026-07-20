@@ -41,6 +41,7 @@ classdef MockImuBrick2 < handle
 
         function start(obj, ~), obj.IsStreaming = true; end
         function stop(obj), obj.IsStreaming = false; end
+        function disconnect(obj), obj.IsStreaming = false; end
     end
 
     methods (Static)

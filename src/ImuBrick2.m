@@ -7,6 +7,10 @@ classdef ImuBrick2 < handle
         IsStreaming = false
     end
 
+    properties (Access = private)
+        CallbackRegistered = false
+    end
+
     methods
         function obj = ImuBrick2(uid, host, port)
             if nargin < 2 || isempty(host)
@@ -37,11 +41,6 @@ classdef ImuBrick2 < handle
                 obj.IPConnection.connect(char(host), port);
                 obj.IsConnected = true;
 
-                % Регистрация callback для всех данных IMU.
-                set(obj.Device, ...
-                    'AllDataCallback', ...
-                    @(~, event)obj.onAllData(event));
-
             catch exception
                 obj.safeDisconnect();
                 rethrow(exception);
@@ -62,6 +61,12 @@ classdef ImuBrick2 < handle
                 {'scalar', 'integer', 'positive'});
 
             obj.checkConnection();
+            if ~obj.CallbackRegistered
+                set(obj.Device, ...
+                    'AllDataCallback', ...
+                    @(~, event)obj.onAllData(event));
+                obj.CallbackRegistered = true;
+            end
             obj.Device.setAllDataPeriod(int64(periodMs));
             obj.IsStreaming = true;
         end
@@ -168,12 +173,29 @@ classdef ImuBrick2 < handle
 
             try
                 obj.Device.setAllDataPeriod(int64(0));
-            catch
+            catch exception
+                warning('IMU:StopStreamFailed', ...
+                    'Не удалось остановить поток IMU при отключении: %s', ...
+                    exception.message);
+            end
+
+            if obj.CallbackRegistered
+                try
+                    set(obj.Device, 'AllDataCallback', []);
+                    obj.CallbackRegistered = false;
+                catch exception
+                    warning('IMU:CallbackCleanupFailed', ...
+                        'Не удалось снять callback IMU при отключении: %s', ...
+                        exception.message);
+                end
             end
 
             try
                 obj.IPConnection.disconnect();
-            catch
+            catch exception
+                warning('IMU:DisconnectFailed', ...
+                    'Не удалось отключиться от Brick Daemon: %s', ...
+                    exception.message);
             end
 
             obj.IsConnected = false;

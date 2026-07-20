@@ -1,11 +1,11 @@
-UID = '6dKiM3'; % Заменить на UID из Brick Viewer
+config = getImuConfig();
 
-imu = ImuBrick2(UID);
+imu = ImuBrick2(config.uid, config.host, config.port);
 
 cleanup = onCleanup(@() imu.disconnect());
 
 % 20 мс — получение данных примерно каждые 0.02 с.
-imu.start(20);
+imu.start(config.callbackPeriodMs);
 
 pause(0.2);
 
