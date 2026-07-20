@@ -1,11 +1,13 @@
 package bus.imu;
 
 import com.tinkerforge.BrickIMUV2;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.ArrayDeque;
+import java.util.Deque;
 
-/** Thread-safe bridge from Tinkerforge's Java listener to MATLAB polling. */
+/** Bounded, thread-safe bridge from Tinkerforge callbacks to MATLAB. */
 public final class ImuAllDataBuffer implements BrickIMUV2.AllDataListener {
+    public static final int DEFAULT_MAX_SIZE = 256;
+
     public static final class Snapshot {
         private final BrickIMUV2.AllDataCallbackData data;
         private final long sequence;
@@ -22,15 +24,57 @@ public final class ImuAllDataBuffer implements BrickIMUV2.AllDataListener {
         public long getTimestampMillis() { return timestampMillis; }
     }
 
-    private final AtomicLong sequence = new AtomicLong(0);
-    private final ConcurrentLinkedQueue<Snapshot> queue = new ConcurrentLinkedQueue<Snapshot>();
+    private final int maxSize;
+    private final Deque<Snapshot> queue;
+    private long receivedCount;
+    private long droppedCount;
+    private long lastSequence;
 
-    @Override
-    public void allData(BrickIMUV2.AllDataCallbackData data) {
-        long next = sequence.incrementAndGet();
-        queue.add(new Snapshot(data, next, System.currentTimeMillis()));
+    public ImuAllDataBuffer() { this(DEFAULT_MAX_SIZE); }
+
+    public ImuAllDataBuffer(int maxSize) {
+        if (maxSize <= 0) {
+            throw new IllegalArgumentException("maxSize must be positive");
+        }
+        this.maxSize = maxSize;
+        this.queue = new ArrayDeque<Snapshot>(maxSize);
     }
 
-    public Snapshot poll() { return queue.poll(); }
-    public long getSequence() { return sequence.get(); }
+    @Override
+    public synchronized void allData(BrickIMUV2.AllDataCallbackData data) {
+        receivedCount++;
+        lastSequence++;
+        if (queue.size() == maxSize) {
+            queue.removeFirst();
+            droppedCount++;
+        }
+        queue.addLast(new Snapshot(data, lastSequence, System.currentTimeMillis()));
+    }
+
+    /** Remove and return the oldest buffered sample. */
+    public synchronized Snapshot poll() { return queue.pollFirst(); }
+
+    /** Return the newest sample and discard any older buffered samples. */
+    public synchronized Snapshot pollLatest() {
+        Snapshot latest = queue.pollLast();
+        if (latest != null) {
+            droppedCount += queue.size();
+            queue.clear();
+        }
+        return latest;
+    }
+
+    /** Start a new stream session with an empty buffer and zeroed counters. */
+    public synchronized void clear() {
+        queue.clear();
+        receivedCount = 0;
+        droppedCount = 0;
+        lastSequence = 0;
+    }
+
+    public synchronized int size() { return queue.size(); }
+    public int getMaxSize() { return maxSize; }
+    public synchronized long getReceivedCount() { return receivedCount; }
+    public synchronized long getDroppedCount() { return droppedCount; }
+    public synchronized long getLastSequence() { return lastSequence; }
 }

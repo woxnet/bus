@@ -7,5 +7,7 @@ function bridge = ensureImuCallbackBridge()
 outputDirectory = buildImuCallbackBridge();
 dynamicPath = javaclasspath('-dynamic');
 if ~any(strcmp(dynamicPath, outputDirectory)), javaaddpath(outputDirectory); end
-bridge = javaObject('bus.imu.ImuAllDataBuffer');
+config = getImuConfig();
+bridge = javaObject('bus.imu.ImuAllDataBuffer', ...
+    int32(config.callbackBufferMaximumSize));
 end

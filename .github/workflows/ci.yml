@@ -1,0 +1,42 @@
+name: hardware-independent-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  structure-and-java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Verify repository structure
+        run: |
+          test -z "$(git ls-files -- lib/Tinkerforge.jar)"
+          test -f java/bus/imu/ImuAllDataBuffer.java
+          test -f src/getImuConfig.m
+      - name: Compile and test bounded Java bridge
+        run: |
+          mkdir -p build/java
+          javac --release 8 -d build/java \
+            java/test/com/tinkerforge/BrickIMUV2.java \
+            java/bus/imu/ImuAllDataBuffer.java \
+            java/test/bus/imu/ImuAllDataBufferTest.java
+          java -ea -cp build/java bus.imu.ImuAllDataBufferTest
+
+  matlab-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: matlab-actions/setup-matlab@v2
+      - name: Run MATLAB unit tests
+        uses: matlab-actions/run-command@v2
+        with:
+          command: startup; results = runtests("tests"); disp(table(results)); assertSuccess(results)
