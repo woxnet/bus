@@ -12,6 +12,9 @@ config.port = 4223;
 config.sampleRateHz = 50;
 config.samplePeriodSeconds = 0.02;
 config.callbackPeriodMs = 20;
+config.sensorFusionMode = 2;
+config.calibrationSampleRateHz = config.sampleRateHz;
+config.calibrationFileVersion = 2;
 
 config.busId = "bus_001";
 config.calibrationDirectory = "calibration";

@@ -5,10 +5,16 @@ classdef ImuBrick2 < handle
         LatestData
         IsConnected = false
         IsStreaming = false
+        UID
+        Host
+        Port
+        StreamingPeriodMs = NaN
+        SampleSequence = uint64(0)
     end
 
     properties (Access = private)
         CallbackRegistered = false
+        CallbackBridge
     end
 
     methods
@@ -24,6 +30,9 @@ classdef ImuBrick2 < handle
             if isempty(uid)
                 error('Необходимо указать UID IMU Brick 2.0.');
             end
+            obj.UID = string(uid);
+            obj.Host = string(host);
+            obj.Port = double(port);
 
             % Создание объектов Tinkerforge.
             obj.IPConnection = javaObject( ...
@@ -62,13 +71,14 @@ classdef ImuBrick2 < handle
 
             obj.checkConnection();
             if ~obj.CallbackRegistered
-                set(obj.Device, ...
-                    'AllDataCallback', ...
-                    @(~, event)obj.onAllData(event));
+                obj.CallbackBridge = ensureImuCallbackBridge();
+                obj.Device.addAllDataListener(obj.CallbackBridge);
                 obj.CallbackRegistered = true;
             end
+
             obj.Device.setAllDataPeriod(int64(periodMs));
             obj.IsStreaming = true;
+            obj.StreamingPeriodMs = double(periodMs);
         end
 
         function stop(obj)
@@ -86,9 +96,53 @@ classdef ImuBrick2 < handle
             data = obj.decodeData(raw);
         end
 
+        function mode = getSensorFusionMode(obj)
+            %GETSENSORFUSIONMODE Return the active Tinkerforge fusion mode.
+            obj.checkConnection();
+            mode = double(obj.Device.getSensorFusionMode());
+        end
+
+        function setSensorFusionMode(obj, mode)
+            %SETSENSORFUSIONMODE Set fusion mode and verify the value.
+            validateattributes(mode, {'numeric'}, ...
+                {'scalar','integer','>=',0,'<=',2});
+            obj.checkConnection();
+            obj.Device.setSensorFusionMode(int16(mode));
+            applied = obj.getSensorFusionMode();
+            if applied ~= double(mode)
+                error('IMU:SensorFusionModeMismatch', ...
+                    'Requested fusion mode %d, device reports %d.', mode, applied);
+            end
+        end
+
+        function identity = getIdentity(obj)
+            %GETIDENTITY Return normalized Tinkerforge device identity data.
+            obj.checkConnection();
+            raw = obj.Device.getIdentity();
+            identity = struct();
+            identity.uid = string(obj.identityField(raw, 'uid'));
+            identity.connectedUid = string(obj.identityField(raw, 'connectedUid'));
+            identity.position = string(obj.identityField(raw, 'position'));
+            identity.hardwareVersion = double( ...
+                obj.identityField(raw, 'hardwareVersion')).';
+            identity.firmwareVersion = double( ...
+                obj.identityField(raw, 'firmwareVersion')).';
+            identity.deviceIdentifier = double( ...
+                obj.identityField(raw, 'deviceIdentifier'));
+        end
+
         function data = latest(obj)
             % Последняя структура, полученная callback-функцией.
-
+            if obj.CallbackRegistered
+                snapshot = obj.CallbackBridge.poll();
+                if ~isempty(snapshot)
+                    obj.LatestData = obj.decodeData(snapshot.getData());
+                    obj.LatestData.hostTimestamp = datetime( ...
+                        double(snapshot.getTimestampMillis()) / 1000, ...
+                        'ConvertFrom', 'posixtime');
+                    obj.LatestData.timestamp = obj.LatestData.hostTimestamp;
+                end
+            end
             if isempty(obj.LatestData)
                 error(['Данные еще не получены. ', ...
                        'Вызовите start() и дождитесь первого callback.']);
@@ -107,12 +161,11 @@ classdef ImuBrick2 < handle
     end
 
     methods (Access = private)
-        function onAllData(obj, event)
-            obj.LatestData = obj.decodeData(event);
-        end
-
-        function data = decodeData(~, raw)
-            data.timestamp = datetime('now');
+        function data = decodeData(obj, raw)
+            obj.SampleSequence = obj.SampleSequence + uint64(1);
+            data.sequenceNumber = obj.SampleSequence;
+            data.hostTimestamp = datetime('now');
+            data.timestamp = data.hostTimestamp;
 
             % Ускорение акселерометра, включая гравитацию, м/с^2.
             data.acceleration = ...
@@ -166,6 +219,11 @@ classdef ImuBrick2 < handle
             end
         end
 
+        function value = identityField(~, raw, name)
+            field = raw.getClass().getField(name);
+            value = field.get(raw);
+        end
+
         function safeDisconnect(obj)
             if ~obj.IsConnected
                 return;
@@ -181,7 +239,7 @@ classdef ImuBrick2 < handle
 
             if obj.CallbackRegistered
                 try
-                    set(obj.Device, 'AllDataCallback', []);
+                    obj.Device.removeAllDataListener(obj.CallbackBridge);
                     obj.CallbackRegistered = false;
                 catch exception
                     warning('IMU:CallbackCleanupFailed', ...

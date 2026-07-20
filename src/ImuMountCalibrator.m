@@ -37,9 +37,10 @@ classdef ImuMountCalibrator < handle
             obj.Config = obj.mergeAndValidateConfig(config);
         end
 
-        function calibration = run(obj, saveFile)
+        function calibration = run(obj, saveFile, metadata)
             %RUN Perform calibration and optionally save it to a MAT-file.
             if nargin < 2, saveFile = ''; end
+            if nargin < 3, metadata = obj.defaultMetadata(); end
             obj.CancelRequested = false;
             obj.ConsecutiveReadErrors = 0;
             obj.setStatus("INITIALIZATION", 0, "Проверка доступности IMU");
@@ -53,7 +54,7 @@ classdef ImuMountCalibrator < handle
                     "Проверка качества калибровки");
                 [R, axes] = obj.buildRotation(zSensor, mean(forward, 1));
                 quality = obj.calculateQuality(stationary, forward, R);
-                calibration = obj.makeCalibration(R, axes, linearBias, gyroBias, quality);
+                calibration = obj.makeCalibration(R, axes, linearBias, gyroBias, quality, metadata);
                 if ~quality.valid
                     obj.LastMessage = "Калибровка отклонена из-за низкого качества";
                     error('IMU:CalibrationRejected', ...
@@ -70,9 +71,7 @@ classdef ImuMountCalibrator < handle
                     obj.setStatus("CANCELLED", obj.Progress, "Калибровка отменена");
                 else
                     obj.State = "FAILED";
-                    if strlength(obj.LastMessage) == 0
-                        obj.LastMessage = string(exception.message);
-                    end
+                    obj.LastMessage = string(exception.message);
                 end
                 rethrow(exception);
             end
@@ -304,9 +303,9 @@ classdef ImuMountCalibrator < handle
                 'forwardSampleCount', size(forward, 1));
         end
 
-        function calibration = makeCalibration(obj, R, axes, linearBias, gyroBias, quality)
+        function calibration = makeCalibration(obj, R, axes, linearBias, gyroBias, quality, metadata)
             calibration = struct();
-            calibration.version = 1;
+            calibration.version = getImuConfig().calibrationFileVersion;
             calibration.createdAt = datetime('now', 'TimeZone', 'UTC');
             calibration.axisConvention = 'X forward, Y left, Z up';
             calibration.rotationVehicleFromSensor = R;
@@ -315,6 +314,14 @@ classdef ImuMountCalibrator < handle
             calibration.sensorAxes = axes;
             calibration.quality = quality;
             calibration.configuration = obj.Config;
+            calibration.metadata = metadata;
+        end
+
+        function metadata = defaultMetadata(obj)
+            metadata = struct('busId', "", 'imuUid', "", ...
+                'deviceIdentifier', NaN, 'firmwareVersion', [NaN NaN NaN], ...
+                'sensorFusionMode', NaN, 'sampleRateHz', obj.Config.sampleRate, ...
+                'algorithmVersion', "2.0");
         end
 
         function saveAtomically(~, calibration, saveFile)

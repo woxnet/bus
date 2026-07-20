@@ -1,397 +1,217 @@
 function report = diagnoseImuBrick2(imu, dependencies)
-%DIAGNOSEIMUBRICK2 Diagnose IMU Brick 2.0 without running calibration.
-%   REPORT = DIAGNOSEIMUBRICK2() checks the JAR, Java bindings, Brick
-%   Daemon and configured physical IMU. An internally created IMU is always
-%   disconnected with onCleanup.
+%DIAGNOSEIMUBRICK2 Run full hardware preflight for IMU Brick 2.0.
+%   REPORT = DIAGNOSEIMUBRICK2() validates local bindings, Brick Daemon,
+%   identity, sensor fusion, synchronous data and a 50 Hz callback stream.
+%   An internally created device is disconnected automatically.
 %
-%   REPORT = DIAGNOSEIMUBRICK2(IMU) performs the same sample validation on
-%   an externally owned device or mock and does not disconnect that object.
-%   Ordinary diagnostic failures are returned in REPORT.errors.
-%
-%   REPORT = DIAGNOSEIMUBRICK2(IMU, DEPENDENCIES) allows tests to override
-%   the JAR path, connection probes, IMU factory, pause function and selected
-%   timing configuration without requiring physical hardware.
+%   REPORT = DIAGNOSEIMUBRICK2(IMU) uses an existing hardware connection,
+%   does not disconnect it, and restores its exact previous stream state.
 
 config = getImuConfig();
 if nargin < 2, dependencies = struct(); end
 dependencies = mergeDependencies(dependencies);
-config = applyConfigOverrides(config, dependencies.configOverrides);
+external = nargin >= 1 && ~isempty(imu);
 report = createReport(config);
-externalImu = nargin >= 1 && ~isempty(imu);
 
-jarFile = dependencies.jarFile;
-jarInfo = inspectTinkerforgeJar(jarFile);
+jarInfo = inspectTinkerforgeJar(dependencies.jarFile);
 report.jarAvailable = jarInfo.exists;
 report.jarSizeBytes = jarInfo.fileSizeBytes;
 report.jarSignatureValid = jarInfo.signatureValid;
-if ~report.jarAvailable
-    report = addError(report, "Не найден Tinkerforge.jar: " + string(jarFile));
-    return;
-end
-if report.jarSizeBytes <= 0
-    report = addError(report, "Tinkerforge.jar пуст: " + string(jarFile));
-    return;
-end
-if ~report.jarSignatureValid
-    report = addError(report, "Tinkerforge.jar не имеет ZIP/JAR-сигнатуры PK.");
+bindings = dependencies.bindingsLoader(dependencies.jarFile);
+report.javaBindingsAvailable = bindings.available;
+if ~bindings.available
+    report.errors = [report.errors; bindings.errors];
     return;
 end
 
-try
-    report.javaBindingsAvailable = logical( ...
-        dependencies.javaBindingsCheck(jarFile, config));
-catch exception
-    report = addError(report, ...
-        "Java bindings Tinkerforge недоступны: " + string(exception.message));
-    return;
-end
-
-if externalImu
+if ~external
+    try
+        report.brickDaemonConnected = dependencies.daemonProbe(config.host, config.port);
+        if ~report.brickDaemonConnected
+            report.errors(end+1, 1) = "Brick Daemon недоступен.";
+            return;
+        end
+        imu = dependencies.imuFactory(config);
+        ownerCleanup = onCleanup(@()imu.disconnect());
+        report.imuConnected = true;
+        report = runHardwarePhases(report, imu, config, dependencies);
+        clear ownerCleanup;
+    catch exception
+        report.errors(end+1, 1) = string(exception.message);
+    end
+else
     report.brickDaemonConnected = true;
     report.imuConnected = true;
-    report = collectDiagnostics(report, imu, config, dependencies.pauseFunction);
-else
     try
-        report.brickDaemonConnected = logical( ...
-            dependencies.daemonProbe(config.host, config.port));
+        report = runHardwarePhases(report, imu, config, dependencies);
     catch exception
-        report = addError(report, ...
-            "Brick Daemon недоступен: " + string(exception.message));
-        return;
+        report.errors(end+1, 1) = string(exception.message);
     end
-    if ~report.brickDaemonConnected
-        report = addError(report, sprintf( ...
-            'Brick Daemon недоступен по адресу %s:%d.', config.host, config.port));
-        return;
-    end
-
-    try
-        imu = dependencies.imuFactory(config);
-        cleanup = onCleanup(@()disconnectImu(imu));
-        report.imuConnected = true;
-        report = collectDiagnostics(report, imu, config, dependencies.pauseFunction);
-        clear cleanup;
-    catch exception
-        report = addError(report, "Ошибка подключения к IMU: " + string(exception.message));
-    end
-end
-
-report = finishReport(report, config);
-end
-
-function report = createReport(config)
-report = struct();
-report.success = false;
-report.uid = config.uid;
-report.host = config.host;
-report.port = config.port;
-report.jarAvailable = false;
-report.jarSizeBytes = 0;
-report.jarSignatureValid = false;
-report.javaBindingsAvailable = false;
-report.brickDaemonConnected = false;
-report.imuConnected = false;
-report.samplesRequested = config.diagnosticSampleCount;
-report.samplesRead = 0;
-report.readErrors = 0;
-report.elapsedSeconds = NaN;
-report.averageReadFrequencyHz = NaN;
-report.meanGravityMagnitude = NaN;
-report.gravityMagnitudeStd = NaN;
-report.meanLinearAcceleration = [NaN NaN NaN];
-report.meanAngularVelocity = [NaN NaN NaN];
-report.meanTemperature = NaN;
-report.fieldsValid = false;
-report.valuesFinite = false;
-report.timestampsAdvance = false;
-report.errors = strings(0, 1);
-report.warnings = strings(0, 1);
-end
-
-function dependencies = mergeDependencies(custom)
-validateattributes(custom, {'struct'}, {'scalar'});
-projectRoot = fileparts(fileparts(mfilename('fullpath')));
-dependencies.jarFile = fullfile(projectRoot, 'lib', 'Tinkerforge.jar');
-dependencies.javaBindingsCheck = @checkJavaBindings;
-dependencies.daemonProbe = @probeBrickDaemon;
-dependencies.imuFactory = @(config)ImuBrick2( ...
-    config.uid, config.host, config.port);
-dependencies.pauseFunction = @pause;
-dependencies.configOverrides = struct();
-fields = fieldnames(custom);
-unknown = setdiff(fields, fieldnames(dependencies));
-if ~isempty(unknown)
-    error('IMU:InvalidDiagnosticDependencies', ...
-        'Неизвестная диагностическая зависимость: %s.', unknown{1});
-end
-for index = 1:numel(fields)
-    dependencies.(fields{index}) = custom.(fields{index});
-end
-validateattributes(dependencies.jarFile, {'char','string'}, {'scalartext'});
-validateattributes(dependencies.javaBindingsCheck, {'function_handle'}, {'scalar'});
-validateattributes(dependencies.daemonProbe, {'function_handle'}, {'scalar'});
-validateattributes(dependencies.imuFactory, {'function_handle'}, {'scalar'});
-validateattributes(dependencies.pauseFunction, {'function_handle'}, {'scalar'});
-validateattributes(dependencies.configOverrides, {'struct'}, {'scalar'});
-end
-
-function config = applyConfigOverrides(config, overrides)
-fields = fieldnames(overrides);
-allowed = {'samplePeriodSeconds','minimumDiagnosticFrequencyHz', ...
-    'maximumDiagnosticFrequencyHz','maxConsecutiveReadErrors', ...
-    'readRetryDelaySeconds'};
-unknown = setdiff(fields, allowed);
-if ~isempty(unknown)
-    error('IMU:InvalidDiagnosticDependencies', ...
-        'Недопустимая настройка диагностики: %s.', unknown{1});
-end
-for index = 1:numel(fields)
-    config.(fields{index}) = overrides.(fields{index});
-end
-end
-
-function available = checkJavaBindings(jarFile, config)
-dynamicPath = javaclasspath('-dynamic');
-staticPath = javaclasspath('-static');
-if ~any(strcmp(dynamicPath, jarFile)) && ~any(strcmp(staticPath, jarFile))
-    javaaddpath(jarFile);
-end
-ipConnection = javaObject('com.tinkerforge.IPConnection');
-device = javaObject('com.tinkerforge.BrickIMUV2', char(config.uid), ipConnection);
-available = ~isempty(ipConnection) && ~isempty(device);
-end
-
-function connected = probeBrickDaemon(host, port)
-socket = javaObject('java.net.Socket');
-cleanup = onCleanup(@()closeSocket(socket));
-address = javaObject('java.net.InetSocketAddress', char(host), int32(port));
-socket.connect(address, int32(2000));
-connected = logical(socket.isConnected());
-clear cleanup;
-end
-
-function closeSocket(socket)
-try
-    socket.close();
-catch exception
-    warning('IMU:SocketCleanupFailed', ...
-        'Не удалось закрыть диагностический сокет: %s', exception.message);
-end
-end
-
-function disconnectImu(imu)
-try
-    imu.disconnect();
-catch exception
-    warning('IMU:DisconnectFailed', ...
-        'Не удалось отключить IMU после диагностики: %s', exception.message);
-end
-end
-
-function report = collectDiagnostics(report, imu, config, pauseFunction)
-count = config.diagnosticSampleCount;
-gravity = zeros(count, 3);
-linearAcceleration = zeros(count, 3);
-angularVelocity = zeros(count, 3);
-temperature = zeros(count, 1);
-timestamps = cell(count, 1);
-readTimes = zeros(count, 1);
-required = {'gravity','linearAcceleration','angularVelocity', ...
-    'quaternion','temperature'};
-consecutiveErrors = 0;
-allFieldsValid = true;
-allValuesFinite = true;
-timer = tic;
-
-while report.samplesRead < count
-    try
-        sample = imu.readOnce();
-        consecutiveErrors = 0;
-    catch exception
-        report.readErrors = report.readErrors + 1;
-        consecutiveErrors = consecutiveErrors + 1;
-        if consecutiveErrors > config.maxConsecutiveReadErrors
-            report = addError(report, sprintf( ...
-                'Превышен лимит последовательных ошибок чтения (%d): %s', ...
-                config.maxConsecutiveReadErrors, exception.message));
-            break;
-        end
-        pauseFunction(config.readRetryDelaySeconds);
-        continue;
-    end
-
-    nextIndex = report.samplesRead + 1;
-    report.samplesRead = nextIndex;
-    [validFields, finiteValues, validationError] = validateSample(sample, required);
-    if ~validFields || ~finiteValues
-        allFieldsValid = validFields;
-        allValuesFinite = finiteValues;
-        report = addError(report, validationError);
-        break;
-    end
-
-    gravity(nextIndex, :) = sample.gravity(:).';
-    linearAcceleration(nextIndex, :) = sample.linearAcceleration(:).';
-    angularVelocity(nextIndex, :) = sample.angularVelocity(:).';
-    temperature(nextIndex) = sample.temperature;
-    timestamps{nextIndex} = sample.timestamp;
-    readTimes(nextIndex) = toc(timer);
-
-    if nextIndex < count
-        nextTarget = readTimes(1) + nextIndex * config.samplePeriodSeconds;
-        pauseFunction(max(0, nextTarget - toc(timer)));
-    end
-end
-
-report.fieldsValid = allFieldsValid && report.samplesRead == count;
-report.valuesFinite = allValuesFinite && report.samplesRead == count;
-if report.samplesRead < count && isempty(report.errors)
-    report = addError(report, sprintf('Получено только %d из %d отсчётов.', ...
-        report.samplesRead, count));
-end
-if report.samplesRead == 0, return; end
-
-validRange = 1:report.samplesRead;
-report.meanGravityMagnitude = mean(vecnorm(gravity(validRange, :), 2, 2));
-report.gravityMagnitudeStd = std(vecnorm(gravity(validRange, :), 2, 2), 0);
-report.meanLinearAcceleration = mean(linearAcceleration(validRange, :), 1);
-report.meanAngularVelocity = mean(angularVelocity(validRange, :), 1);
-report.meanTemperature = mean(temperature(validRange));
-
-if report.samplesRead > 1
-    report.elapsedSeconds = readTimes(report.samplesRead) - readTimes(1);
-    if report.elapsedSeconds > 0
-        report.averageReadFrequencyHz = ...
-            (report.samplesRead - 1) / report.elapsedSeconds;
-    end
-    advances = false(report.samplesRead - 1, 1);
-    for index = 2:report.samplesRead
-        advances(index - 1) = timestampAdvances(timestamps{index - 1}, timestamps{index});
-    end
-    report.timestampsAdvance = all(advances);
-else
-    report.elapsedSeconds = 0;
-end
-
-if report.readErrors > 0 && report.samplesRead == count
-    report = addWarning(report, sprintf( ...
-        'Диагностика восстановилась после ошибок чтения: %d.', report.readErrors));
-end
-end
-
-function [fieldsValid, valuesFinite, message] = validateSample(sample, required)
-fieldsValid = true;
-valuesFinite = true;
-message = "";
-if ~isstruct(sample) || ~isscalar(sample)
-    fieldsValid = false;
-    message = "Отсчёт IMU должен быть скалярной структурой.";
-    return;
-end
-for index = 1:numel(required)
-    if ~isfield(sample, required{index})
-        fieldsValid = false;
-        message = "В отсчёте отсутствует поле " + string(required{index}) + ".";
-        return;
-    end
-end
-if ~isfield(sample, 'timestamp')
-    fieldsValid = false;
-    message = "В отсчёте отсутствует поле timestamp.";
-    return;
-end
-vectorSizes = struct('gravity', 3, 'linearAcceleration', 3, ...
-    'angularVelocity', 3, 'quaternion', 4);
-vectorFields = fieldnames(vectorSizes);
-for index = 1:numel(vectorFields)
-    field = vectorFields{index};
-    value = sample.(field);
-    if ~(isnumeric(value) && numel(value) == vectorSizes.(field))
-        fieldsValid = false;
-        message = "Поле " + string(field) + " имеет неверный размер.";
-        return;
-    end
-    if any(~isfinite(value(:)))
-        valuesFinite = false;
-        message = "Поле " + string(field) + " содержит NaN или Inf.";
-        return;
-    end
-end
-if ~(isnumeric(sample.temperature) && isscalar(sample.temperature))
-    fieldsValid = false;
-    message = "Поле temperature должно быть числовым скаляром.";
-elseif ~isfinite(sample.temperature)
-    valuesFinite = false;
-    message = "Поле temperature содержит NaN или Inf.";
-end
-end
-
-function advances = timestampAdvances(previous, current)
-try
-    if isdatetime(previous) && isdatetime(current) && ...
-            isscalar(previous) && isscalar(current) && ...
-            ~ismissing(previous) && ~ismissing(current)
-        advances = seconds(current - previous) > 0;
-    elseif isduration(previous) && isduration(current) && ...
-            isscalar(previous) && isscalar(current)
-        advances = seconds(current - previous) > 0;
-    elseif isnumeric(previous) && isnumeric(current) && ...
-            isscalar(previous) && isscalar(current) && ...
-            isfinite(previous) && isfinite(current)
-        advances = current > previous;
-    else
-        advances = false;
-    end
-catch
-    advances = false;
-end
-end
-
-function report = finishReport(report, config)
-if report.samplesRead ~= report.samplesRequested
-    report = addErrorOnce(report, sprintf('Получено %d из %d запрошенных отсчётов.', ...
-        report.samplesRead, report.samplesRequested));
-end
-if report.samplesRead == report.samplesRequested && ~report.timestampsAdvance
-    report = addError(report, "Временные метки отсчётов не возрастают.");
-end
-if isfinite(report.meanGravityMagnitude) && ...
-        abs(report.meanGravityMagnitude - config.gravityReference) > ...
-        config.maximumGravityError
-    report = addError(report, sprintf( ...
-        'Средняя величина гравитации %.3f м/с^2 вне допустимого диапазона.', ...
-        report.meanGravityMagnitude));
-end
-frequencyValid = isfinite(report.averageReadFrequencyHz) && ...
-    report.averageReadFrequencyHz >= config.minimumDiagnosticFrequencyHz && ...
-    report.averageReadFrequencyHz <= config.maximumDiagnosticFrequencyHz;
-if report.samplesRead == report.samplesRequested && ~frequencyValid
-    report = addError(report, sprintf( ...
-        'Частота %.2f Гц вне допустимого диапазона %.1f–%.1f Гц.', ...
-        report.averageReadFrequencyHz, config.minimumDiagnosticFrequencyHz, ...
-        config.maximumDiagnosticFrequencyHz));
 end
 report.success = report.jarAvailable && report.jarSizeBytes > 0 && ...
     report.jarSignatureValid && report.javaBindingsAvailable && ...
     report.brickDaemonConnected && report.imuConnected && ...
-    report.samplesRead == report.samplesRequested && report.fieldsValid && ...
-    report.valuesFinite && report.timestampsAdvance && frequencyValid && ...
-    isfinite(report.meanGravityMagnitude) && ...
+    report.configuredUidMatches && report.sensorFusionModeValid && ...
+    report.synchronousSamplesRead >= 20 && report.callbackSamplesRead >= 100 && ...
+    report.callbackFrequencyHz >= config.minimumDiagnosticFrequencyHz && ...
+    report.callbackFrequencyHz <= config.maximumDiagnosticFrequencyHz && ...
+    report.callbackTimestampsAdvance && report.callbackSequenceAdvances && ...
     abs(report.meanGravityMagnitude - config.gravityReference) <= ...
-    config.maximumGravityError && isempty(report.errors);
+    config.maximumGravityError && abs(report.meanQuaternionNorm - 1) <= 0.1 && ...
+    isempty(report.errors);
 end
 
-function report = addError(report, message)
-report.errors(end + 1, 1) = string(message);
+function report = runHardwarePhases(report, imu, config, dependencies)
+report.identity = imu.getIdentity();
+report.configuredUidMatches = string(report.identity.uid) == config.uid;
+if ~report.configuredUidMatches
+    report.errors(end+1, 1) = "UID устройства не совпадает с конфигурацией.";
+    return;
+end
+imu.setSensorFusionMode(config.sensorFusionMode);
+report.sensorFusionMode = imu.getSensorFusionMode();
+report.sensorFusionModeValid = report.sensorFusionMode == config.sensorFusionMode;
+if ~report.sensorFusionModeValid
+    report.errors(end+1, 1) = "Sensor fusion mode не был применён.";
+    return;
+end
+dependencies.pauseFunction(dependencies.fusionSettleDelaySeconds);
+
+wasStreaming = logical(imu.IsStreaming);
+previousPeriod = double(imu.StreamingPeriodMs);
+streamCleanup = onCleanup(@()restoreStream(imu, wasStreaming, previousPeriod));
+if wasStreaming, imu.stop(); end
+
+syncOptions = struct('sampleCount', 20, ...
+    'samplePeriodSeconds', config.samplePeriodSeconds, ...
+    'minimumFrequencyHz', 0, 'maximumFrequencyHz', Inf, ...
+    'pauseFunction', dependencies.pauseFunction);
+sync = diagnoseImuDataSource(imu, syncOptions);
+report.synchronousSamplesRead = sync.samplesRead;
+report.samplesRequested = sync.samplesRequested;
+report.samplesRead = sync.samplesRead;
+report.readErrors = sync.readErrors;
+report.elapsedSeconds = sync.elapsedSeconds;
+report.averageReadFrequencyHz = sync.averageReadFrequencyHz;
+report.meanGravityMagnitude = sync.meanGravityMagnitude;
+report.gravityMagnitudeStd = sync.gravityMagnitudeStd;
+report.meanLinearAcceleration = sync.meanLinearAcceleration;
+report.meanAngularVelocity = sync.meanAngularVelocity;
+report.meanTemperature = sync.meanTemperature;
+report.fieldsValid = sync.fieldsValid;
+report.valuesFinite = sync.valuesFinite;
+report.timestampsAdvance = sync.timestampsAdvance;
+report.meanQuaternionNorm = sync.meanQuaternionNorm;
+report.calibrationStatus = sync.calibrationStatus;
+if ~sync.success
+    report.errors = [report.errors; sync.errors];
+    clear streamCleanup;
+    return;
 end
 
-function report = addErrorOnce(report, message)
-message = string(message);
-if ~any(report.errors == message)
-    report.errors(end + 1, 1) = message;
+imu.start(config.callbackPeriodMs);
+[callback, callbackErrors] = collectCallbacks(imu, config, dependencies.pauseFunction);
+report.callbackSamplesRead = callback.count;
+report.callbackFrequencyHz = callback.frequencyHz;
+report.callbackTimestampsAdvance = callback.timestampsAdvance;
+report.callbackSequenceAdvances = callback.sequenceAdvances;
+if ~isempty(callbackErrors), report.errors = [report.errors; callbackErrors]; end
+clear streamCleanup;
+end
+
+function [result, errors] = collectCallbacks(imu, config, pauseFunction)
+count = 100;
+sequences = zeros(count, 1, 'uint64');
+timestamps = NaT(count, 1);
+received = 0;
+lastSequence = uint64(0);
+timer = tic;
+timeout = max(5, count * config.callbackPeriodMs / 1000 * 3);
+errors = strings(0, 1);
+while received < count && toc(timer) < timeout
+    try
+        sample = imu.latest();
+        sequence = uint64(sample.sequenceNumber);
+        if sequence ~= lastSequence
+            received = received + 1;
+            sequences(received) = sequence;
+            timestamps(received) = sample.hostTimestamp;
+            lastSequence = sequence;
+        end
+    catch exception
+        if ~contains(string(exception.message), "не получены") && ...
+                ~contains(string(exception.identifier), "NotStreaming")
+            errors(end+1, 1) = string(exception.message); %#ok<AGROW>
+            break;
+        end
+    end
+    pauseFunction(0.001);
+end
+result.count = received;
+result.frequencyHz = NaN;
+result.timestampsAdvance = false;
+result.sequenceAdvances = false;
+if received >= 2
+    elapsed = seconds(timestamps(received) - timestamps(1));
+    if elapsed > 0, result.frequencyHz = (received - 1) / elapsed; end
+    result.timestampsAdvance = all(seconds(diff(timestamps(1:received))) > 0);
+    result.sequenceAdvances = all(diff(sequences(1:received)) > 0);
+end
+if received < count, errors(end+1, 1) = sprintf('Callback: получено %d из %d отсчётов.', received, count); end
+if ~(result.frequencyHz >= config.minimumDiagnosticFrequencyHz && ...
+        result.frequencyHz <= config.maximumDiagnosticFrequencyHz)
+    errors(end+1, 1) = "Частота callback вне допустимого диапазона.";
+end
+if ~result.timestampsAdvance, errors(end+1, 1) = "Callback timestamps не возрастают."; end
+if ~result.sequenceAdvances, errors(end+1, 1) = "Callback sequence numbers не возрастают."; end
+end
+
+function restoreStream(imu, wasStreaming, previousPeriod)
+try
+    imu.stop();
+    if wasStreaming, imu.start(previousPeriod); end
+catch exception
+    warning('IMU:StreamRestoreFailed', 'Не удалось восстановить поток: %s', exception.message);
 end
 end
 
-function report = addWarning(report, message)
-report.warnings(end + 1, 1) = string(message);
+function report = createReport(config)
+report = struct('success', false, 'uid', config.uid, 'host', config.host, ...
+    'port', config.port, 'jarAvailable', false, 'jarSizeBytes', 0, ...
+    'jarSignatureValid', false, 'javaBindingsAvailable', false, ...
+    'brickDaemonConnected', false, 'imuConnected', false, ...
+    'identity', struct(), 'configuredUidMatches', false, ...
+    'sensorFusionMode', NaN, 'sensorFusionModeValid', false, ...
+    'samplesRequested', 0, 'samplesRead', 0, 'readErrors', 0, ...
+    'elapsedSeconds', NaN, 'averageReadFrequencyHz', NaN, ...
+    'meanGravityMagnitude', NaN, 'gravityMagnitudeStd', NaN, ...
+    'meanLinearAcceleration', [NaN NaN NaN], ...
+    'meanAngularVelocity', [NaN NaN NaN], 'meanTemperature', NaN, ...
+    'fieldsValid', false, 'valuesFinite', false, 'timestampsAdvance', false, ...
+    'synchronousSamplesRead', 0, 'callbackSamplesRead', 0, ...
+    'callbackFrequencyHz', NaN, 'callbackTimestampsAdvance', false, ...
+    'callbackSequenceAdvances', false, 'meanQuaternionNorm', NaN, ...
+    'calibrationStatus', struct(), 'errors', strings(0, 1), ...
+    'warnings', strings(0, 1));
+end
+
+function dependencies = mergeDependencies(custom)
+root = fileparts(fileparts(mfilename('fullpath')));
+dependencies.jarFile = fullfile(root, 'lib', 'Tinkerforge.jar');
+dependencies.bindingsLoader = @loadTinkerforgeBindings;
+dependencies.daemonProbe = @probeDaemon;
+dependencies.imuFactory = @(config)ImuBrick2(config.uid, config.host, config.port);
+dependencies.pauseFunction = @pause;
+dependencies.fusionSettleDelaySeconds = 0.5;
+fields = fieldnames(custom);
+for index = 1:numel(fields), dependencies.(fields{index}) = custom.(fields{index}); end
+end
+
+function connected = probeDaemon(host, port)
+socket = javaObject('java.net.Socket');
+cleanup = onCleanup(@()socket.close());
+address = javaObject('java.net.InetSocketAddress', char(host), int32(port));
+socket.connect(address, int32(2000));
+connected = logical(socket.isConnected());
+clear cleanup;
 end

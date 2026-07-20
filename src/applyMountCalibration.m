@@ -3,6 +3,8 @@ function vehicleData = applyMountCalibration(sensorData, calibration)
 %   VEHICLEDATA = APPLYMOUNTCALIBRATION(SENSORDATA, CALIBRATION) returns a
 %   copy of SENSORDATA and transforms available 3-D vector fields. Bias is
 %   removed from linear acceleration and angular velocity only.
+%   sensorEuler and sensorQuaternion, when present, remain explicitly in the
+%   sensor coordinate system; no ambiguous euler/quaternion fields are kept.
 
 report = validateImuCalibration(calibration);
 if ~report.valid
@@ -13,6 +15,14 @@ if ~isstruct(sensorData) || ~isscalar(sensorData)
 end
 
 vehicleData = sensorData;
+if isfield(sensorData, 'euler')
+    vehicleData.sensorEuler = sensorData.euler;
+    vehicleData = rmfield(vehicleData, 'euler');
+end
+if isfield(sensorData, 'quaternion')
+    vehicleData.sensorQuaternion = sensorData.quaternion;
+    vehicleData = rmfield(vehicleData, 'quaternion');
+end
 R = calibration.rotationVehicleFromSensor;
 fields = {'linearAcceleration','angularVelocity','gravity','acceleration','magneticField'};
 for index = 1:numel(fields)
