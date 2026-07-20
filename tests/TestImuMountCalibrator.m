@@ -43,7 +43,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             rest = MockImuBrick2.createStationarySequence(8, eye(3));
             forward = MockImuBrick2.createForwardAccelerationSequence(8, eye(3), 1);
             imu = MockImuBrick2([good; moving; rest; forward]);
-            calibration = ImuMountCalibrator(imu, config).run();
+            calibration = ImuMountCalibrator(imu, config).run('', [], ...
+                'AllowSyntheticMetadata', true);
             testCase.verifyTrue(calibration.quality.valid);
             testCase.verifyGreaterThan(imu.ReadCount, 15);
         end
@@ -55,7 +56,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             turn = MockImuBrick2.createTurningSequence(1, eye(3), 1);
             forward = MockImuBrick2.createForwardAccelerationSequence(8, eye(3), 1);
             imu = MockImuBrick2([stationary; first; turn; forward]);
-            calibration = ImuMountCalibrator(imu, config).run();
+            calibration = ImuMountCalibrator(imu, config).run('', [], ...
+                'AllowSyntheticMetadata', true);
             testCase.verifyTrue(calibration.quality.valid);
             testCase.verifyGreaterThanOrEqual(imu.ReadCount, 20);
         end
@@ -71,14 +73,16 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
                 forward(index).linearAcceleration = [cosd(directions(index)) sind(directions(index)) 0];
             end
             calibrator = ImuMountCalibrator(MockImuBrick2([stationary; forward]), config);
-            testCase.verifyError(@()calibrator.run(), 'IMU:CalibrationRejected');
+            testCase.verifyError(@()calibrator.run('', [], ...
+                'AllowSyntheticMetadata', true), 'IMU:CalibrationRejected');
         end
 
         function stationaryTimeout(testCase)
             config = testCase.fastConfig(); config.stationaryTimeout = 0.05;
             moving = MockImuBrick2.makeSample([0 0 -9.81], [1 0 0], [0 0 0]);
             calibrator = ImuMountCalibrator(MockImuBrick2(moving), config);
-            testCase.verifyError(@()calibrator.run(), 'IMU:StationaryTimeout');
+            testCase.verifyError(@()calibrator.run('', [], ...
+                'AllowSyntheticMetadata', true), 'IMU:StationaryTimeout');
             testCase.verifyEqual(calibrator.State, "FAILED");
             testCase.verifyTrue(contains(calibrator.LastMessage, ...
                 "continuous stationary interval"));
@@ -88,7 +92,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             config = testCase.fastConfig(); config.forwardTimeout = 0.05;
             stationary = MockImuBrick2.createStationarySequence(20, eye(3));
             calibrator = ImuMountCalibrator(MockImuBrick2(stationary), config);
-            testCase.verifyError(@()calibrator.run(), 'IMU:ForwardTimeout');
+            testCase.verifyError(@()calibrator.run('', [], ...
+                'AllowSyntheticMetadata', true), 'IMU:ForwardTimeout');
         end
 
         function cancellation(testCase)
@@ -96,7 +101,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             imu = MockImuBrick2(MockImuBrick2.makeSample([0 0 -9.81], [1 0 0], [0 0 0]));
             calibrator = ImuMountCalibrator(imu, config);
             imu.OnRead = @(count)cancelAt(count, calibrator);
-            testCase.verifyError(@()calibrator.run(), 'IMU:CalibrationCancelled');
+            testCase.verifyError(@()calibrator.run('', [], ...
+                'AllowSyntheticMetadata', true), 'IMU:CalibrationCancelled');
             testCase.verifyEqual(calibrator.State, "CANCELLED");
 
             function cancelAt(count, target)
@@ -124,7 +130,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             stationary = MockImuBrick2.createStationarySequence(9, eye(3));
             forward = MockImuBrick2.createForwardAccelerationSequence(8, eye(3), 1);
             imu = MockImuBrick2([stationary; forward]); imu.FailureReads = [1 2];
-            calibration = ImuMountCalibrator(imu, config).run();
+            calibration = ImuMountCalibrator(imu, config).run('', [], ...
+                'AllowSyntheticMetadata', true);
             testCase.verifyTrue(calibration.quality.valid);
         end
 
@@ -144,6 +151,13 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             testCase.verifyError(@()calibrator.run(fullfile(directory, 'x.mat')), ...
                 'IMU:CalibrationMetadataRequired');
             clear cleanup;
+        end
+
+        function directRunRequiresExplicitMetadata(testCase)
+            calibrator = ImuMountCalibrator(MockImuBrick2(), ...
+                testCase.fastConfig());
+            testCase.verifyError(@()calibrator.run(), ...
+                'IMU:CalibrationMetadataRequired');
         end
 
         function emptyVersionTwoMetadataRejected(testCase)
@@ -236,7 +250,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             imu = MockImuBrick2([stationary; forward]);
             calibrator = ImuMountCalibrator(imu, config);
             if isempty(saveFile)
-                calibration = calibrator.run();
+                calibration = calibrator.run('', [], ...
+                    'AllowSyntheticMetadata', true);
             else
                 calibration = calibrator.run(saveFile, testCase.hardwareMetadata());
             end

@@ -22,7 +22,7 @@ try
     end
     dynamicPath = javaclasspath('-dynamic');
     staticPath = javaclasspath('-static');
-    bridgePath = buildImuCallbackBridge();
+    bridgePath = getImuCallbackBridgePath();
     allPaths = [dynamicPath(:); staticPath(:)];
     alreadyLoaded = any(strcmp(allPaths, char(jarFile)));
     conflicting = any(contains(string(allPaths), "Tinkerforge.jar", ...

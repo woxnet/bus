@@ -58,9 +58,8 @@ report.success = report.jarAvailable && report.jarSizeBytes > 0 && ...
     report.callbackFrequencyHz <= config.maximumDiagnosticFrequencyHz && ...
     report.callbackTimestampsAdvance && report.callbackSequenceAdvances && ...
     report.callbackMissingSequences == 0 && ...
-    report.callbackDroppedSamples <= config.preflightMaximumDroppedSamples && ...
-    report.callbackMaximumAgeMs <= 2 * config.callbackPeriodMs && ...
-    report.callbackRestartClean && ...
+    report.callbackDroppedSamples <= config.maximumPreflightDroppedCallbacks && ...
+    report.callbackMaximumAgeMs <= config.maximumCallbackSampleAgeMs && ...
     abs(report.meanGravityMagnitude - config.gravityReference) <= ...
     config.maximumGravityError && abs(report.meanQuaternionNorm - 1) <= 0.1 && ...
     isempty(report.errors);
@@ -125,9 +124,12 @@ if ~sync.success
 end
 
 imu.clearCallbackBuffer();
+initialCallbackStats = imu.getCallbackStats();
 imu.start(config.callbackPeriodMs);
-[callback, callbackErrors] = collectCallbacks(imu, config, dependencies.pauseFunction);
+[callback, callbackErrors] = collectCallbacks(imu, config, ...
+    dependencies.pauseFunction, initialCallbackStats);
 report.callbackSamplesRead = callback.count;
+report.callbackReceivedTotal = callback.receivedTotal;
 report.callbackFrequencyHz = callback.frequencyHz;
 report.callbackTimestampsAdvance = callback.timestampsAdvance;
 report.callbackSequenceAdvances = callback.sequenceAdvances;
@@ -135,33 +137,36 @@ report.callbackFirstSequence = callback.firstSequence;
 report.callbackLastSequence = callback.lastSequence;
 report.callbackMissingSequences = callback.missingSequences;
 report.callbackDroppedSamples = callback.droppedSamples;
+report.callbackBufferCapacity = callback.bufferCapacity;
+report.callbackMaximumBuffered = callback.maximumBuffered;
+report.callbackMeanAgeMs = callback.meanAgeMs;
 report.callbackMaximumAgeMs = callback.maximumAgeMs;
-report.callbackBufferMaximumSize = config.callbackBufferMaximumSize;
-report.callbackRestartClean = callback.restartClean;
 if ~isempty(callbackErrors), report.errors = [report.errors; callbackErrors]; end
 clear streamCleanup;
 end
 
-function [result, errors] = collectCallbacks(imu, config, pauseFunction)
+function [result, errors] = collectCallbacks(imu, config, pauseFunction, initialStats)
 count = 100;
 sequences = zeros(count, 1, 'uint64');
 timestamps = zeros(count, 1);
 agesMs = NaN(count, 1);
 received = 0;
+maximumBuffered = 0;
 timer = tic;
 timeout = max(5, count * config.callbackPeriodMs / 1000 * 3);
 errors = strings(0, 1);
 while received < count && toc(timer) < timeout
     sampleAvailable = false;
     try
+        currentStats = imu.getCallbackStats();
+        maximumBuffered = max(maximumBuffered, double(currentStats.buffered));
         sample = imu.nextCallbackMetadata();
         if ~isempty(sample)
             sampleAvailable = true;
             received = received + 1;
             sequences(received) = uint64(sample.sequenceNumber);
-            timestamps(received) = sample.timestampMillis / 1000;
-            agesMs(received) = 1000 * posixtime( ...
-                datetime('now', 'TimeZone', 'UTC')) - sample.timestampMillis;
+            timestamps(received) = sample.timestampEpochMillis / 1000;
+            agesMs(received) = sample.callbackAgeMs;
         end
     catch exception
         if ~contains(string(exception.identifier), "NotStreaming")
@@ -178,9 +183,12 @@ result.sequenceAdvances = false;
 result.firstSequence = uint64(0);
 result.lastSequence = uint64(0);
 result.missingSequences = Inf;
+result.receivedTotal = 0;
 result.droppedSamples = Inf;
+result.bufferCapacity = double(initialStats.capacity);
+result.maximumBuffered = maximumBuffered;
+result.meanAgeMs = Inf;
 result.maximumAgeMs = Inf;
-result.restartClean = false;
 if received >= 2
     elapsed = timestamps(received) - timestamps(1);
     if elapsed > 0, result.frequencyHz = (received - 1) / elapsed; end
@@ -190,11 +198,14 @@ if received >= 2
     result.lastSequence = sequences(received);
     result.missingSequences = sum(max(0, ...
         diff(double(sequences(1:received))) - 1));
+    result.meanAgeMs = mean(agesMs(1:received));
     result.maximumAgeMs = max(agesMs(1:received));
-    result.restartClean = result.firstSequence == uint64(1);
 end
 stats = imu.getCallbackStats();
-result.droppedSamples = double(stats.dropped);
+result.receivedTotal = double(stats.received - initialStats.received);
+result.droppedSamples = double(stats.dropped - initialStats.dropped);
+result.bufferCapacity = double(stats.capacity);
+result.maximumBuffered = max(result.maximumBuffered, double(stats.buffered));
 if received < count, errors(end+1, 1) = sprintf('Callback: получено %d из %d отсчётов.', received, count); end
 if ~(result.frequencyHz >= config.minimumDiagnosticFrequencyHz && ...
         result.frequencyHz <= config.maximumDiagnosticFrequencyHz)
@@ -203,9 +214,8 @@ end
 if ~result.timestampsAdvance, errors(end+1, 1) = "Callback timestamps не возрастают."; end
 if ~result.sequenceAdvances, errors(end+1, 1) = "Callback sequence numbers не возрастают."; end
 if result.missingSequences ~= 0, errors(end+1, 1) = "Callback sequence contains missing samples."; end
-if result.droppedSamples > config.preflightMaximumDroppedSamples, errors(end+1, 1) = "Callback buffer dropped samples."; end
-if result.maximumAgeMs > 2 * config.callbackPeriodMs, errors(end+1, 1) = "Callback sample is too old."; end
-if ~result.restartClean, errors(end+1, 1) = "Callback restart returned stale session data."; end
+if result.droppedSamples > config.maximumPreflightDroppedCallbacks, errors(end+1, 1) = "Callback buffer dropped samples."; end
+if result.maximumAgeMs > config.maximumCallbackSampleAgeMs, errors(end+1, 1) = "Callback sample is too old."; end
 end
 
 function restoreStream(imu, wasStreaming, previousPeriod)
@@ -236,9 +246,10 @@ report = struct('success', false, 'uid', config.uid, 'host', config.host, ...
     'callbackFrequencyHz', NaN, 'callbackTimestampsAdvance', false, ...
     'callbackSequenceAdvances', false, 'callbackFirstSequence', uint64(0), ...
     'callbackLastSequence', uint64(0), 'callbackMissingSequences', Inf, ...
-    'callbackDroppedSamples', Inf, 'callbackMaximumAgeMs', Inf, ...
-    'callbackBufferMaximumSize', config.callbackBufferMaximumSize, ...
-    'callbackRestartClean', false, 'meanQuaternionNorm', NaN, ...
+    'callbackReceivedTotal', 0, 'callbackDroppedSamples', Inf, ...
+    'callbackBufferCapacity', config.callbackBufferCapacity, ...
+    'callbackMaximumBuffered', 0, 'callbackMeanAgeMs', Inf, ...
+    'callbackMaximumAgeMs', Inf, 'meanQuaternionNorm', NaN, ...
     'calibrationStatus', struct(), 'errors', strings(0, 1), ...
     'warnings', strings(0, 1));
 end

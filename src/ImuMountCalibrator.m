@@ -37,15 +37,21 @@ classdef ImuMountCalibrator < handle
             obj.Config = obj.mergeAndValidateConfig(config);
         end
 
-        function calibration = run(obj, saveFile, metadata)
+        function calibration = run(obj, saveFile, metadata, varargin)
             %RUN Perform calibration and optionally save it to a MAT-file.
             if nargin < 2, saveFile = ''; end
-            if nargin < 3
-                if ~isempty(saveFile)
+            if nargin < 3, metadata = []; end
+            parser = inputParser;
+            parser.addParameter('AllowSyntheticMetadata', false, ...
+                @(value)islogical(value) && isscalar(value));
+            parser.parse(varargin{:});
+            if isempty(metadata)
+                if ~parser.Results.AllowSyntheticMetadata
                     error('IMU:CalibrationMetadataRequired', ...
-                        'Version 2 calibration files require hardware metadata.');
+                        ['Calibration requires hardware metadata. Tests must ', ...
+                         'explicitly set AllowSyntheticMetadata to true.']);
                 end
-                metadata = obj.defaultMetadata();
+                metadata = obj.defaultSyntheticMetadata();
             end
             obj.CancelRequested = false;
             obj.ConsecutiveReadErrors = 0;
@@ -323,7 +329,7 @@ classdef ImuMountCalibrator < handle
             calibration.metadata = metadata;
         end
 
-        function metadata = defaultMetadata(obj)
+        function metadata = defaultSyntheticMetadata(obj)
             metadata = struct('busId', "synthetic", 'imuUid', "synthetic", ...
                 'deviceIdentifier', 18, 'firmwareVersion', [0 0 0], ...
                 'sensorFusionMode', getImuConfig().sensorFusionMode, ...

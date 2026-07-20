@@ -9,7 +9,7 @@ classdef ImuBrick2 < handle
         Host
         Port
         StreamingPeriodMs = NaN
-        SampleSequence = uint64(0)
+        SynchronousSequence = uint64(0)
     end
 
     properties (Access = private)
@@ -102,8 +102,8 @@ classdef ImuBrick2 < handle
 
             obj.checkConnection();
             raw = obj.Device.getAllData();
-            obj.SampleSequence = obj.SampleSequence + uint64(1);
-            data = obj.decodeData(raw, "synchronous", obj.SampleSequence, ...
+            obj.SynchronousSequence = obj.SynchronousSequence + uint64(1);
+            data = obj.decodeData(raw, "synchronous", obj.SynchronousSequence, ...
                 datetime('now'), uint64(0));
         end
 
@@ -144,14 +144,16 @@ classdef ImuBrick2 < handle
 
         function data = latest(obj)
             %LATEST Return the newest callback sample and discard backlog.
-            if obj.CallbackRegistered
-                snapshot = obj.CallbackBridge.pollLatest();
-                if ~isempty(snapshot), obj.LatestData = obj.decodeSnapshot(snapshot); end
+            if ~obj.CallbackRegistered
+                error('IMU:NoNewCallbackSample', ...
+                    'No new callback sample is available.');
             end
-            if isempty(obj.LatestData)
-                error('IMU:CallbackNotReady', ...
-                    'No callback data is available. Call start() and wait.');
+            snapshot = obj.CallbackBridge.pollLatest();
+            if isempty(snapshot)
+                error('IMU:NoNewCallbackSample', ...
+                    'No new callback sample is available.');
             end
+            obj.LatestData = obj.decodeSnapshot(snapshot);
             data = obj.LatestData;
         end
 
@@ -159,7 +161,7 @@ classdef ImuBrick2 < handle
             %NEXTCALLBACKSAMPLE Remove and return the oldest buffered sample.
             data = [];
             if ~obj.CallbackRegistered, return; end
-            snapshot = obj.CallbackBridge.poll();
+            snapshot = obj.CallbackBridge.pollOldest();
             if ~isempty(snapshot), data = obj.decodeSnapshot(snapshot); end
         end
 
@@ -167,11 +169,13 @@ classdef ImuBrick2 < handle
             %NEXTCALLBACKMETADATA Poll sequence/timing without payload decoding.
             metadata = [];
             if ~obj.CallbackRegistered, return; end
-            snapshot = obj.CallbackBridge.poll();
+            snapshot = obj.CallbackBridge.pollOldest();
             if isempty(snapshot), return; end
             metadata = struct('sequenceNumber', uint64(snapshot.getSequence()), ...
-                'timestampMillis', double(snapshot.getTimestampMillis()), ...
-                'callbackDroppedBeforeSample', obj.CallbackDroppedCount);
+                'timestampEpochMillis', double(snapshot.getTimestampEpochMillis()), ...
+                'timestampNanos', double(snapshot.getTimestampNanos()), ...
+                'callbackAgeMs', double(snapshot.getAgeNanos()) / 1e6, ...
+                'callbackDroppedTotal', obj.CallbackDroppedCount);
         end
 
         function samples = drainCallbackSamples(obj, maxCount)
@@ -187,7 +191,7 @@ classdef ImuBrick2 < handle
         end
 
         function clearCallbackBuffer(obj)
-            %CLEARCALLBACKBUFFER Reset buffered data and per-session counters.
+            %CLEARCALLBACKBUFFER Clear queued data; lifetime counters persist.
             obj.LatestData = [];
             if obj.CallbackRegistered, obj.CallbackBridge.clear(); end
         end
@@ -196,6 +200,7 @@ classdef ImuBrick2 < handle
             stats = struct('received', obj.CallbackReceivedCount, ...
                 'dropped', obj.CallbackDroppedCount, ...
                 'buffered', obj.CallbackBufferedCount, ...
+                'capacity', obj.bridgeMetric('getCapacity'), ...
                 'lastSequence', obj.LastCallbackSequence, ...
                 'streamingPeriodMs', obj.StreamingPeriodMs);
         end
@@ -229,9 +234,11 @@ classdef ImuBrick2 < handle
         function data = decodeData(~, raw, source, sequence, timestamp, dropped)
             data.source = string(source);
             data.sequenceNumber = uint64(sequence);
-            data.callbackDroppedBeforeSample = uint64(dropped);
+            data.callbackDroppedTotal = uint64(dropped);
             data.hostTimestamp = timestamp;
             data.timestamp = data.hostTimestamp;
+            data.callbackReceivedTimestamp = NaT('TimeZone', 'UTC');
+            data.callbackAgeMs = NaN;
 
             % Ускорение акселерометра, включая гравитацию, м/с^2.
             data.acceleration = ...
@@ -280,11 +287,13 @@ classdef ImuBrick2 < handle
         end
 
         function data = decodeSnapshot(obj, snapshot)
-            timestamp = datetime(double(snapshot.getTimestampMillis()) / 1000, ...
+            timestamp = datetime(double(snapshot.getTimestampEpochMillis()) / 1000, ...
                 'ConvertFrom', 'posixtime', 'TimeZone', 'UTC');
             data = obj.decodeData(snapshot.getData(), "callback", ...
                 uint64(snapshot.getSequence()), timestamp, ...
                 obj.CallbackDroppedCount);
+            data.callbackReceivedTimestamp = timestamp;
+            data.callbackAgeMs = double(snapshot.getAgeNanos()) / 1e6;
         end
 
         function value = bridgeMetric(obj, methodName)
@@ -297,6 +306,7 @@ classdef ImuBrick2 < handle
                 case 'getDroppedCount', raw = obj.CallbackBridge.getDroppedCount();
                 case 'size', raw = obj.CallbackBridge.size();
                 case 'getLastSequence', raw = obj.CallbackBridge.getLastSequence();
+                case 'getCapacity', raw = obj.CallbackBridge.getCapacity();
                 otherwise, error('IMU:InternalError', 'Unknown bridge metric.');
             end
             value = uint64(raw);

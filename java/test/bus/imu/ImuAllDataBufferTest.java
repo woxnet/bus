@@ -6,7 +6,7 @@ public final class ImuAllDataBufferTest {
         boundedAndDropped();
         latestDiscardsBacklog();
         fifoDrainIsSequential();
-        clearStartsNewSession();
+        clearPreservesLifetimeSequence();
         longRunStaysBounded();
         System.out.println("ImuAllDataBufferTest passed");
     }
@@ -15,6 +15,7 @@ public final class ImuAllDataBufferTest {
         ImuAllDataBuffer buffer = new ImuAllDataBuffer(3);
         offer(buffer, 5);
         check(buffer.size() == 3, "buffer exceeded maximum size");
+        check(buffer.getCapacity() == 3, "capacity is wrong");
         check(buffer.getDroppedCount() == 2, "overflow drop count is wrong");
     }
 
@@ -31,18 +32,23 @@ public final class ImuAllDataBufferTest {
         ImuAllDataBuffer buffer = new ImuAllDataBuffer(8);
         offer(buffer, 4);
         for (long expected = 1; expected <= 4; expected++) {
-            check(buffer.poll().getSequence() == expected, "FIFO order is broken");
+            check(buffer.pollOldest().getSequence() == expected, "FIFO order is broken");
         }
     }
 
-    private static void clearStartsNewSession() {
+    private static void clearPreservesLifetimeSequence() {
         ImuAllDataBuffer buffer = new ImuAllDataBuffer(8);
         offer(buffer, 3);
         buffer.clear();
-        check(buffer.size() == 0 && buffer.getReceivedCount() == 0 &&
-                buffer.getDroppedCount() == 0, "clear did not reset session");
+        check(buffer.size() == 0, "clear did not empty queue");
+        check(buffer.getReceivedCount() == 3 && buffer.getDroppedCount() == 0,
+                "clear reset lifetime counters");
         offer(buffer, 1);
-        check(buffer.poll().getSequence() == 1, "sequence did not restart after clear");
+        ImuAllDataBuffer.Snapshot snapshot = buffer.pollOldest();
+        check(snapshot.getSequence() == 4, "sequence restarted after clear");
+        check(snapshot.getTimestampEpochMillis() > 0, "epoch timestamp is missing");
+        check(snapshot.getTimestampNanos() > 0 && snapshot.getAgeNanos() >= 0,
+                "monotonic timestamp is invalid");
     }
 
     private static void longRunStaysBounded() {
@@ -50,6 +56,7 @@ public final class ImuAllDataBufferTest {
         offer(buffer, 1_000_000);
         check(buffer.size() == 32, "long simulation grew the queue");
         check(buffer.getReceivedCount() == 1_000_000, "received count is wrong");
+        check(buffer.getDroppedCount() == 999_968, "long-run drop count is wrong");
     }
 
     private static void offer(ImuAllDataBuffer buffer, int count) {

@@ -7,11 +7,10 @@ transforming measurements into bus coordinates: X forward, Y left, Z up.
 ## Requirements
 
 - MATLAB R2021b or newer;
-- JDK 8 or newer with `javac` available on `PATH` (the callback bridge is
-  compiled to Java 8 bytecode on first use);
+- the JVM bundled with MATLAB (no JDK is required for normal runtime);
 - Tinkerforge Brick Daemon running locally;
 - official Tinkerforge Java/MATLAB bindings;
-- Tinkerforge IMU Brick 2.0 with UID `6dKiM3`.
+- the configured Tinkerforge IMU Brick 2.0.
 
 The UID and all runtime settings are defined only by `src/getImuConfig.m`.
 
@@ -58,8 +57,20 @@ threshold is based on the official Tinkerforge IMU Brick 2.0 changelog:
 https://raw.githubusercontent.com/Tinkerforge/imu-v2-brick/master/software/changelog
 
 The callback bridge uses a bounded 256-sample buffer. `latest()` drops stale
-backlog and returns the newest sample; use `nextCallbackSample()` or
+backlog and returns the newest unread sample; it raises
+`IMU:NoNewCallbackSample` instead of repeating an old sample. Use
+`nextCallbackSample()` or
 `drainCallbackSamples(maxCount)` when every sequential sample is required.
+Callback sequence and received/dropped counters remain monotonic when the
+queue is cleared or the stream is restarted.
+
+Normal runtime loads `lib-generated/imu-callback-bridge.jar`. Developers only
+need JDK 8 or newer when rebuilding it reproducibly:
+
+```matlab
+startup;
+buildImuCallbackBridgeJar();
+```
 
 ## Installation calibration
 

@@ -34,6 +34,14 @@ classdef TestImuCallbackBuild < matlab.unittest.TestCase
                 'IMU:JavaCompilerUnavailable');
         end
 
+        function runtimeUsesShippedBridgeWithoutCompilation(testCase)
+            bridgePath = getImuCallbackBridgePath();
+            expected = fullfile(testCase.ProjectRoot, 'lib-generated', ...
+                'imu-callback-bridge.jar');
+            testCase.verifyEqual(bridgePath, expected);
+            testCase.verifyTrue(isfile(bridgePath));
+        end
+
         function jarTimestampInvalidatesBuild(testCase)
             options = testCase.options();
             [~, first] = buildImuCallbackBridge(options);

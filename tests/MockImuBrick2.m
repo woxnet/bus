@@ -8,7 +8,7 @@ classdef MockImuBrick2 < handle
         Host = "localhost"
         Port = 4223
         StreamingPeriodMs = NaN
-        SampleSequence = uint64(0)
+        SynchronousSequence = uint64(0)
         LatestData = []
         CallbackReceivedCount = uint64(0)
         CallbackDroppedCount = uint64(0)
@@ -28,7 +28,6 @@ classdef MockImuBrick2 < handle
         CallbackSequenceStep = 1
         CallbackTimestampOffsetSeconds = 0
         InjectedDroppedSamples = 0
-        CallbackSequenceStart = 0
     end
     properties (Access = private)
         Index = 1
@@ -36,7 +35,7 @@ classdef MockImuBrick2 < handle
         LastCallbackTime = 0
         CallbackQueue = cell(0, 1)
         CallbackGeneratedCount = 0
-        CallbackMaximumSize = 256
+        CallbackBufferCapacity = 256
     end
 
     methods
@@ -67,8 +66,8 @@ classdef MockImuBrick2 < handle
                 data = obj.Samples(obj.Index);
                 obj.Index = obj.Index + 1;
             end
-            obj.SampleSequence = obj.SampleSequence + uint64(1);
-            data.sequenceNumber = obj.SampleSequence;
+            obj.SynchronousSequence = obj.SynchronousSequence + uint64(1);
+            data.sequenceNumber = obj.SynchronousSequence;
             if ~isfield(data, 'hostTimestamp'), data.hostTimestamp = data.timestamp; end
             data.timestamp = data.hostTimestamp;
         end
@@ -79,8 +78,9 @@ classdef MockImuBrick2 < handle
             obj.StreamingPeriodMs = double(periodMs);
             obj.StreamTimer = tic;
             obj.LastCallbackTime = 0;
-            obj.LastCallbackSequence = uint64(obj.CallbackSequenceStart);
-            obj.CallbackDroppedCount = uint64(obj.InjectedDroppedSamples);
+            obj.CallbackGeneratedCount = 0;
+            obj.CallbackDroppedCount = obj.CallbackDroppedCount + ...
+                uint64(obj.InjectedDroppedSamples);
         end
         function stop(obj)
             obj.IsStreaming = false;
@@ -89,14 +89,14 @@ classdef MockImuBrick2 < handle
         function data = latest(obj)
             if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
             obj.updateCallbacks();
-            if ~isempty(obj.CallbackQueue)
-                obj.LatestData = obj.CallbackQueue{end};
-                stale = numel(obj.CallbackQueue) - 1;
-                obj.CallbackDroppedCount = obj.CallbackDroppedCount + uint64(stale);
-                obj.CallbackQueue = cell(0, 1);
-                obj.CallbackBufferedCount = uint64(0);
+            if isempty(obj.CallbackQueue)
+                error('IMU:NoNewCallbackSample', 'No new callback sample is available.');
             end
-            if isempty(obj.LatestData), error('MockImu:CallbackNotReady', 'No callback data.'); end
+            obj.LatestData = obj.CallbackQueue{end};
+            stale = numel(obj.CallbackQueue) - 1;
+            obj.CallbackDroppedCount = obj.CallbackDroppedCount + uint64(stale);
+            obj.CallbackQueue = cell(0, 1);
+            obj.CallbackBufferedCount = uint64(0);
             data = obj.LatestData;
         end
         function data = nextCallbackSample(obj)
@@ -116,9 +116,10 @@ classdef MockImuBrick2 < handle
                 metadata = [];
             else
                 metadata = struct('sequenceNumber', sample.sequenceNumber, ...
-                    'timestampMillis', 1000 * posixtime(sample.hostTimestamp), ...
-                    'callbackDroppedBeforeSample', ...
-                    sample.callbackDroppedBeforeSample);
+                    'timestampEpochMillis', 1000 * posixtime(sample.hostTimestamp), ...
+                    'timestampNanos', NaN, ...
+                    'callbackAgeMs', sample.callbackAgeMs, ...
+                    'callbackDroppedTotal', sample.callbackDroppedTotal);
             end
         end
         function samples = drainCallbackSamples(obj, maxCount)
@@ -132,11 +133,7 @@ classdef MockImuBrick2 < handle
         end
         function clearCallbackBuffer(obj)
             obj.CallbackQueue = cell(0, 1);
-            obj.CallbackGeneratedCount = 0;
-            obj.CallbackReceivedCount = uint64(0);
-            obj.CallbackDroppedCount = uint64(0);
             obj.CallbackBufferedCount = uint64(0);
-            obj.LastCallbackSequence = uint64(0);
             obj.LatestData = [];
         end
         function stats = getCallbackStats(obj)
@@ -144,6 +141,7 @@ classdef MockImuBrick2 < handle
             stats = struct('received', obj.CallbackReceivedCount, ...
                 'dropped', obj.CallbackDroppedCount, ...
                 'buffered', obj.CallbackBufferedCount, ...
+                'capacity', uint64(obj.CallbackBufferCapacity), ...
                 'lastSequence', obj.LastCallbackSequence, ...
                 'streamingPeriodMs', obj.StreamingPeriodMs);
         end
@@ -174,8 +172,10 @@ classdef MockImuBrick2 < handle
                 sample.hostTimestamp = datetime('now', 'TimeZone', 'UTC') - ...
                     seconds(obj.CallbackTimestampOffsetSeconds);
                 sample.timestamp = sample.hostTimestamp;
-                sample.callbackDroppedBeforeSample = obj.CallbackDroppedCount;
-                if numel(obj.CallbackQueue) == obj.CallbackMaximumSize
+                sample.callbackReceivedTimestamp = sample.hostTimestamp;
+                sample.callbackAgeMs = 1000 * obj.CallbackTimestampOffsetSeconds;
+                sample.callbackDroppedTotal = obj.CallbackDroppedCount;
+                if numel(obj.CallbackQueue) == obj.CallbackBufferCapacity
                     obj.CallbackQueue(1) = [];
                     obj.CallbackDroppedCount = obj.CallbackDroppedCount + uint64(1);
                 end
