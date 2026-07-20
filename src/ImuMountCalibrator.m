@@ -40,7 +40,13 @@ classdef ImuMountCalibrator < handle
         function calibration = run(obj, saveFile, metadata)
             %RUN Perform calibration and optionally save it to a MAT-file.
             if nargin < 2, saveFile = ''; end
-            if nargin < 3, metadata = obj.defaultMetadata(); end
+            if nargin < 3
+                if ~isempty(saveFile)
+                    error('IMU:CalibrationMetadataRequired', ...
+                        'Version 2 calibration files require hardware metadata.');
+                end
+                metadata = obj.defaultMetadata();
+            end
             obj.CancelRequested = false;
             obj.ConsecutiveReadErrors = 0;
             obj.setStatus("INITIALIZATION", 0, "Проверка доступности IMU");
@@ -318,10 +324,11 @@ classdef ImuMountCalibrator < handle
         end
 
         function metadata = defaultMetadata(obj)
-            metadata = struct('busId', "", 'imuUid', "", ...
-                'deviceIdentifier', NaN, 'firmwareVersion', [NaN NaN NaN], ...
-                'sensorFusionMode', NaN, 'sampleRateHz', obj.Config.sampleRate, ...
-                'algorithmVersion', "2.0");
+            metadata = struct('busId', "synthetic", 'imuUid', "synthetic", ...
+                'deviceIdentifier', 18, 'firmwareVersion', [0 0 0], ...
+                'sensorFusionMode', getImuConfig().sensorFusionMode, ...
+                'sampleRateHz', obj.Config.sampleRate, ...
+                'algorithmVersion', "2.0", 'synthetic', true);
         end
 
         function saveAtomically(~, calibration, saveFile)

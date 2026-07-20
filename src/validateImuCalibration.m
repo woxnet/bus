@@ -37,6 +37,38 @@ try
                         metadataFields{metadataIndex}, '.'];
                 end
             end
+            if isempty(report.errors)
+                metadata = calibration.metadata;
+                config = getImuConfig();
+                if ~(isTextScalar(metadata.busId) && strlength(string(metadata.busId)) > 0)
+                    report.errors{end+1} = 'metadata.busId must be nonempty.';
+                end
+                if ~(isTextScalar(metadata.imuUid) && strlength(string(metadata.imuUid)) > 0)
+                    report.errors{end+1} = 'metadata.imuUid must be nonempty.';
+                end
+                if ~(isnumeric(metadata.deviceIdentifier) && isscalar(metadata.deviceIdentifier) && ...
+                        isfinite(metadata.deviceIdentifier) && metadata.deviceIdentifier == 18)
+                    report.errors{end+1} = 'metadata.deviceIdentifier must equal 18.';
+                end
+                if ~(isnumeric(metadata.firmwareVersion) && ...
+                        numel(metadata.firmwareVersion) == 3 && ...
+                        all(isfinite(metadata.firmwareVersion(:))))
+                    report.errors{end+1} = 'metadata.firmwareVersion must contain three finite values.';
+                end
+                if ~(isnumeric(metadata.sensorFusionMode) && ...
+                        isscalar(metadata.sensorFusionMode) && ...
+                        metadata.sensorFusionMode == config.sensorFusionMode)
+                    report.errors{end+1} = 'metadata.sensorFusionMode does not match project configuration.';
+                end
+                if ~(isnumeric(metadata.sampleRateHz) && isscalar(metadata.sampleRateHz) && ...
+                        isfinite(metadata.sampleRateHz) && metadata.sampleRateHz > 0)
+                    report.errors{end+1} = 'metadata.sampleRateHz must be positive.';
+                end
+                if ~(isTextScalar(metadata.algorithmVersion) && ...
+                        strlength(string(metadata.algorithmVersion)) > 0)
+                    report.errors{end+1} = 'metadata.algorithmVersion must be nonempty.';
+                end
+            end
         end
     end
 
@@ -111,5 +143,10 @@ report.valid = isempty(report.errors);
         if ~(isnumeric(value) && isequal(size(value), [3 1]) && all(isfinite(value(:))))
             report.errors{end+1} = [label, ' must be a finite 3-by-1 vector.'];
         end
+    end
+
+    function valid = isTextScalar(value)
+        valid = (ischar(value) && (isrow(value) || isempty(value))) || ...
+            (isstring(value) && isscalar(value));
     end
 end

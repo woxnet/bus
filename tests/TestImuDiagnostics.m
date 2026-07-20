@@ -78,6 +78,57 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             testCase.verifyTrue(report.success);
             testCase.verifyEqual(report.callbackSamplesRead, 100);
             testCase.verifyTrue(report.callbackSequenceAdvances);
+            testCase.verifyEqual(report.callbackMissingSequences, 0);
+            testCase.verifyEqual(report.callbackDroppedSamples, 0);
+            testCase.verifyLessThanOrEqual(report.callbackMaximumAgeMs, 40);
+        end
+
+        function missingCallbackSequenceRejected(testCase)
+            imu = testCase.hardwareMock(); imu.CallbackSequenceStep = 2;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyGreaterThan(report.callbackMissingSequences, 0);
+        end
+
+        function staleCallbackRejected(testCase)
+            imu = testCase.hardwareMock(); imu.CallbackTimestampOffsetSeconds = 0.1;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyGreaterThan(report.callbackMaximumAgeMs, 40);
+        end
+
+        function droppedCallbackRejected(testCase)
+            imu = testCase.hardwareMock(); imu.InjectedDroppedSamples = 1;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyEqual(report.callbackDroppedSamples, 1);
+        end
+
+        function staleSessionSequenceRejected(testCase)
+            imu = testCase.hardwareMock(); imu.CallbackSequenceStart = 100;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyFalse(report.callbackRestartClean);
+        end
+
+        function latestAndSequentialDrainSemantics(testCase)
+            imu = testCase.hardwareMock(); imu.start(1); pause(0.01);
+            newest = imu.latest();
+            testCase.verifyEqual(newest.sequenceNumber, imu.LastCallbackSequence);
+            testCase.verifyEqual(imu.CallbackBufferedCount, uint64(0));
+            imu.stop(); imu.start(1); pause(0.005);
+            samples = imu.drainCallbackSamples(3);
+            sequences = cellfun(@(sample)double(sample.sequenceNumber), samples);
+            testCase.verifyEqual(sequences, (1:numel(samples)).');
+        end
+
+        function stopStartClearsOldCallbacks(testCase)
+            imu = testCase.hardwareMock(); imu.start(1); pause(0.005);
+            old = imu.nextCallbackSample(); %#ok<NASGU>
+            imu.stop(); imu.start(1); pause(0.002);
+            fresh = imu.nextCallbackSample();
+            testCase.verifyEqual(fresh.sequenceNumber, uint64(1));
+            testCase.verifyEqual(fresh.callbackDroppedBeforeSample, uint64(0));
         end
 
         function frozenCallbackRejected(testCase)

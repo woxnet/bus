@@ -135,6 +135,33 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             testCase.verifyEqual(calibration.metadata.algorithmVersion, "2.0");
         end
 
+        function saveRequiresHardwareMetadata(testCase)
+            directory = tempname; mkdir(directory);
+            cleanup = onCleanup(@()rmdir(directory, 's'));
+            config = testCase.fastConfig();
+            imu = MockImuBrick2();
+            calibrator = ImuMountCalibrator(imu, config);
+            testCase.verifyError(@()calibrator.run(fullfile(directory, 'x.mat')), ...
+                'IMU:CalibrationMetadataRequired');
+            clear cleanup;
+        end
+
+        function emptyVersionTwoMetadataRejected(testCase)
+            calibration = testCase.runSuccessful(eye(3));
+            calibration.metadata.busId = "";
+            calibration.metadata.imuUid = "";
+            calibration.metadata.firmwareVersion = [NaN NaN NaN];
+            report = validateImuCalibration(calibration);
+            testCase.verifyFalse(report.valid);
+        end
+
+        function validHardwareMetadataAccepted(testCase)
+            calibration = testCase.runSuccessful(eye(3));
+            calibration.metadata = testCase.hardwareMetadata();
+            report = validateImuCalibration(calibration);
+            testCase.verifyTrue(report.valid, strjoin(report.errors, ' '));
+        end
+
         function calibrationMismatchRejected(testCase)
             directory = tempname; mkdir(directory);
             cleanup = onCleanup(@()rmdir(directory, 's'));
@@ -207,7 +234,21 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             stationary = MockImuBrick2.createStationarySequence(9, rotation, linearBias, gyroBias);
             forward = MockImuBrick2.createForwardAccelerationSequence(8, rotation, 1, linearBias, gyroBias);
             imu = MockImuBrick2([stationary; forward]);
-            calibration = ImuMountCalibrator(imu, config).run(saveFile);
+            calibrator = ImuMountCalibrator(imu, config);
+            if isempty(saveFile)
+                calibration = calibrator.run();
+            else
+                calibration = calibrator.run(saveFile, testCase.hardwareMetadata());
+            end
+        end
+
+        function metadata = hardwareMetadata(~)
+            project = getImuConfig();
+            metadata = struct('busId', project.busId, 'imuUid', project.uid, ...
+                'deviceIdentifier', 18, 'firmwareVersion', [2 0 15], ...
+                'sensorFusionMode', project.sensorFusionMode, ...
+                'sampleRateHz', project.sampleRateHz, ...
+                'algorithmVersion', "2.0");
         end
 
         function config = fastConfig(~)
