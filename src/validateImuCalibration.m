@@ -1,9 +1,10 @@
-function report = validateImuCalibration(calibration)
+function report = validateImuCalibration(calibration, allowLegacy)
 %VALIDATEIMUCALIBRATION Validate an IMU installation calibration structure.
 %   REPORT = VALIDATEIMUCALIBRATION(CALIBRATION) returns REPORT.valid,
 %   REPORT.errors and REPORT.warnings without throwing for normal invalid data.
 
 report = struct('valid', false, 'errors', {{}}, 'warnings', {{}});
+if nargin < 2, allowLegacy = false; end
 try
     if ~isstruct(calibration) || ~isscalar(calibration)
         report.errors{end+1} = 'Calibration must be a scalar structure.';
@@ -20,8 +21,23 @@ try
     if ~isempty(report.errors), return; end
 
     if ~(isnumeric(calibration.version) && isscalar(calibration.version) && ...
-            isfinite(calibration.version) && calibration.version == 1)
+            isfinite(calibration.version) && any(calibration.version == [1 2]))
         report.errors{end+1} = 'Unsupported calibration format version.';
+    elseif calibration.version == 1 && ~allowLegacy
+        report.errors{end+1} = 'Legacy calibration version 1 requires AllowLegacy=true.';
+    elseif calibration.version == 2
+        if ~isfield(calibration, 'metadata') || ~isstruct(calibration.metadata)
+            report.errors{end+1} = 'Version 2 calibration requires metadata.';
+        else
+            metadataFields = {'busId','imuUid','deviceIdentifier','firmwareVersion', ...
+                'sensorFusionMode','sampleRateHz','algorithmVersion'};
+            for metadataIndex = 1:numel(metadataFields)
+                if ~isfield(calibration.metadata, metadataFields{metadataIndex})
+                    report.errors{end+1} = ['Missing metadata field: ', ...
+                        metadataFields{metadataIndex}, '.'];
+                end
+            end
+        end
     end
 
     R = calibration.rotationVehicleFromSensor;

@@ -31,6 +31,11 @@ try
         result.errors(end+1, 1) = "Исходный файл не имеет ZIP/JAR-сигнатуры PK.";
         return;
     end
+    if ~tinkerforgeJarHasRequiredClasses(sourceFile)
+        result.errors(end+1, 1) = ...
+            "Исходный JAR не содержит требуемые классы Tinkerforge.";
+        return;
+    end
 
     destinationDirectory = fileparts(destinationFile);
     if ~isfolder(destinationDirectory), mkdir(destinationDirectory); end
@@ -50,16 +55,11 @@ try
         clear cleanup;
     end
 
-    dynamicPath = javaclasspath('-dynamic');
-    staticPath = javaclasspath('-static');
-    if ~any(strcmp(dynamicPath, destinationFile)) && ...
-            ~any(strcmp(staticPath, destinationFile))
-        javaaddpath(destinationFile);
+    loadStatus = loadTinkerforgeBindings(destinationFile);
+    result.javaBindingsAvailable = loadStatus.available;
+    if ~loadStatus.available
+        result.errors = [result.errors; loadStatus.errors];
     end
-    ipConnection = javaObject('com.tinkerforge.IPConnection');
-    device = javaObject('com.tinkerforge.BrickIMUV2', ...
-        char(getImuConfig().uid), ipConnection);
-    result.javaBindingsAvailable = ~isempty(ipConnection) && ~isempty(device);
     result.success = result.jarSignatureValid && result.javaBindingsAvailable;
 catch exception
     result.errors(end+1, 1) = string(exception.message);

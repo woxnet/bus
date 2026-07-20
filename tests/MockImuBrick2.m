@@ -4,15 +4,28 @@ classdef MockImuBrick2 < handle
         ReadCount = 0
         IsStreaming = false
         DisconnectCount = 0
+        UID
+        Host = "localhost"
+        Port = 4223
+        StreamingPeriodMs = NaN
+        SampleSequence = uint64(0)
+        LatestData = []
     end
     properties
         Samples
         RepeatLast = true
         FailureReads = []
         OnRead = []
+        SensorFusionMode = 2
+        IgnoreSensorFusionSet = false
+        Identity
+        FreezeCallback = false
+        CallbackPeriodScale = 1
     end
     properties (Access = private)
         Index = 1
+        StreamTimer
+        LastCallbackTime = 0
     end
 
     methods
@@ -21,6 +34,11 @@ classdef MockImuBrick2 < handle
                 samples = MockImuBrick2.makeSample([0 0 -9.81], [0 0 0], [0 0 0]);
             end
             obj.Samples = samples(:);
+            config = getImuConfig();
+            obj.UID = config.uid;
+            obj.Identity = struct('uid', config.uid, 'connectedUid', "0", ...
+                'position', "a", 'hardwareVersion', [1 0 0], ...
+                'firmwareVersion', [2 0 0], 'deviceIdentifier', 18);
         end
 
         function data = readOnce(obj)
@@ -38,10 +56,37 @@ classdef MockImuBrick2 < handle
                 data = obj.Samples(obj.Index);
                 obj.Index = obj.Index + 1;
             end
+            obj.SampleSequence = obj.SampleSequence + uint64(1);
+            data.sequenceNumber = obj.SampleSequence;
+            if ~isfield(data, 'hostTimestamp'), data.hostTimestamp = data.timestamp; end
+            data.timestamp = data.hostTimestamp;
         end
 
-        function start(obj, ~), obj.IsStreaming = true; end
+        function start(obj, periodMs)
+            obj.IsStreaming = true;
+            obj.StreamingPeriodMs = double(periodMs);
+            obj.StreamTimer = tic;
+            obj.LastCallbackTime = 0;
+        end
         function stop(obj), obj.IsStreaming = false; end
+        function data = latest(obj)
+            if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
+            elapsed = toc(obj.StreamTimer);
+            due = obj.StreamingPeriodMs / 1000 * obj.CallbackPeriodScale;
+            if isempty(obj.LatestData) || (~obj.FreezeCallback && ...
+                    elapsed - obj.LastCallbackTime >= due)
+                obj.LatestData = obj.readOnce();
+                obj.LatestData.hostTimestamp = datetime('now');
+                obj.LatestData.timestamp = obj.LatestData.hostTimestamp;
+                obj.LastCallbackTime = elapsed;
+            end
+            data = obj.LatestData;
+        end
+        function mode = getSensorFusionMode(obj), mode = obj.SensorFusionMode; end
+        function setSensorFusionMode(obj, mode)
+            if ~obj.IgnoreSensorFusionSet, obj.SensorFusionMode = double(mode); end
+        end
+        function identity = getIdentity(obj), identity = obj.Identity; end
         function disconnect(obj)
             obj.IsStreaming = false;
             obj.DisconnectCount = obj.DisconnectCount + 1;
@@ -82,7 +127,9 @@ classdef MockImuBrick2 < handle
         end
 
         function sample = makeSample(gravity, linearAcceleration, angularVelocity)
-            sample = struct('timestamp', datetime('now'), ...
+            timestamp = datetime('now');
+            sample = struct('timestamp', timestamp, 'hostTimestamp', timestamp, ...
+                'sequenceNumber', uint64(0), ...
                 'acceleration', gravity(:).' + linearAcceleration(:).', ...
                 'linearAcceleration', linearAcceleration(:).', ...
                 'gravity', gravity(:).', ...
@@ -97,6 +144,7 @@ classdef MockImuBrick2 < handle
             firstTimestamp = datetime('now');
             for index = 1:numel(samples)
                 samples(index).timestamp = firstTimestamp + seconds((index - 1) * stepSeconds);
+                samples(index).hostTimestamp = samples(index).timestamp;
             end
         end
     end

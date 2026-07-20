@@ -80,6 +80,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             calibrator = ImuMountCalibrator(MockImuBrick2(moving), config);
             testCase.verifyError(@()calibrator.run(), 'IMU:StationaryTimeout');
             testCase.verifyEqual(calibrator.State, "FAILED");
+            testCase.verifyTrue(contains(calibrator.LastMessage, ...
+                "continuous stationary interval"));
         end
 
         function forwardTimeout(testCase)
@@ -124,6 +126,76 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             imu = MockImuBrick2([stationary; forward]); imu.FailureReads = [1 2];
             calibration = ImuMountCalibrator(imu, config).run();
             testCase.verifyTrue(calibration.quality.valid);
+        end
+
+        function calibrationVersionTwoMetadata(testCase)
+            calibration = testCase.runSuccessful(eye(3));
+            testCase.verifyEqual(calibration.version, 2);
+            testCase.verifyTrue(isfield(calibration, 'metadata'));
+            testCase.verifyEqual(calibration.metadata.algorithmVersion, "2.0");
+        end
+
+        function calibrationMismatchRejected(testCase)
+            directory = tempname; mkdir(directory);
+            cleanup = onCleanup(@()rmdir(directory, 's'));
+            calibration = testCase.runSuccessful(eye(3));
+            calibration.metadata.busId = "bus_a";
+            calibration.metadata.imuUid = "imu_a";
+            file = fullfile(directory, 'bound.mat');
+            save(file, 'calibration');
+            testCase.verifyError(@()loadImuCalibration(file, "bus_b", "imu_a"), ...
+                'IMU:CalibrationBusMismatch');
+            testCase.verifyError(@()loadImuCalibration(file, "bus_a", "imu_b"), ...
+                'IMU:CalibrationDeviceMismatch');
+            clear cleanup;
+        end
+
+        function legacyCalibrationRequiresExplicitPermission(testCase)
+            directory = tempname; mkdir(directory);
+            cleanup = onCleanup(@()rmdir(directory, 's'));
+            calibration = testCase.runSuccessful(eye(3));
+            calibration.version = 1;
+            calibration = rmfield(calibration, 'metadata');
+            file = fullfile(directory, 'legacy.mat');
+            save(file, 'calibration');
+            testCase.verifyError(@()loadImuCalibration(file), ...
+                'IMU:InvalidCalibrationFile');
+            loaded = loadImuCalibration(file, 'AllowLegacy', true);
+            testCase.verifyEqual(loaded.version, 1);
+            clear cleanup;
+        end
+
+        function projectPathIndependentOfPwd(testCase)
+            original = pwd;
+            directory = tempname; mkdir(directory);
+            cleanup = onCleanup(@()restore(original, directory));
+            cd(directory);
+            resolved = resolveProjectPath('calibration');
+            root = fileparts(fileparts(mfilename('fullpath')));
+            testCase.verifyEqual(resolved, string(fullfile(root, 'calibration')));
+            clear cleanup;
+
+            function restore(folder, temporary)
+                cd(folder); rmdir(temporary, 's');
+            end
+        end
+
+        function orientationFieldsAreExplicit(testCase)
+            calibration = testCase.runSuccessful(eye(3));
+            data = struct('linearAcceleration',[0 0 0], ...
+                'angularVelocity',[0 0 0], 'euler',[1 2 3], ...
+                'quaternion',[1 0 0 0]);
+            transformed = applyMountCalibration(data, calibration);
+            testCase.verifyFalse(isfield(transformed, 'euler'));
+            testCase.verifyFalse(isfield(transformed, 'quaternion'));
+            testCase.verifyEqual(transformed.sensorEuler, [1 2 3]);
+            testCase.verifyEqual(transformed.sensorQuaternion, [1 0 0 0]);
+        end
+
+        function calibrationRateUsesProjectConfig(testCase)
+            project = getImuConfig();
+            calibration = getImuCalibrationConfig();
+            testCase.verifyEqual(calibration.sampleRate, project.sampleRateHz);
         end
     end
 

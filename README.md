@@ -15,7 +15,8 @@ The UID and all runtime settings are defined only by `src/getImuConfig.m`.
 
 ## Install Tinkerforge bindings
 
-Do not commit the third-party JAR. Install an official local copy with:
+Do not commit the third-party JAR. From the official Tinkerforge MATLAB/Octave
+bindings archive, use exactly `matlab/Tinkerforge.jar` and install it with:
 
 ```matlab
 startup;
@@ -24,6 +25,8 @@ assert(result.success);
 ```
 
 The resulting local file is `lib/Tinkerforge.jar` and is ignored by Git.
+After replacing a JAR that MATLAB has already loaded, restart MATLAB before
+continuing.
 
 ## Unit tests
 
