@@ -1,0 +1,4 @@
+lib/Tinkerforge.jar
+calibration/
+*.asv
+*.mat

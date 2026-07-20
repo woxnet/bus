@@ -1,17 +1,9 @@
 projectRoot = fileparts(mfilename('fullpath'));
 jarFile = fullfile(projectRoot, 'lib', 'Tinkerforge.jar');
 
-if ~isfile(jarFile)
-    error('IMU:MissingTinkerforgeJar', ...
-        'Не найден файл Tinkerforge.jar: %s', jarFile);
-end
-
-dynamicJavaPath = javaclasspath('-dynamic');
-
-if ~any(strcmp(dynamicJavaPath, jarFile))
-    javaaddpath(jarFile);
-end
-
 addpath(fullfile(projectRoot, 'src'));
+addpath(fullfile(projectRoot, 'examples'));
 
-clear projectRoot jarFile dynamicJavaPath;
+bindingStatus = loadTinkerforgeBindings(jarFile);
+
+clear projectRoot jarFile bindingStatus;

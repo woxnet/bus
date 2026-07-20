@@ -3,6 +3,7 @@ classdef MockImuBrick2 < handle
     properties (SetAccess = private)
         ReadCount = 0
         IsStreaming = false
+        DisconnectCount = 0
     end
     properties
         Samples
@@ -41,7 +42,10 @@ classdef MockImuBrick2 < handle
 
         function start(obj, ~), obj.IsStreaming = true; end
         function stop(obj), obj.IsStreaming = false; end
-        function disconnect(obj), obj.IsStreaming = false; end
+        function disconnect(obj)
+            obj.IsStreaming = false;
+            obj.DisconnectCount = obj.DisconnectCount + 1;
+        end
     end
 
     methods (Static)
@@ -52,6 +56,7 @@ classdef MockImuBrick2 < handle
             gravity = rotation' * [0;0;-9.81];
             sample = MockImuBrick2.makeSample(gravity, linearBias, gyroBias);
             samples = repmat(sample, count, 1);
+            samples = MockImuBrick2.withAdvancingTimestamps(samples, 0.02);
         end
 
         function samples = createForwardAccelerationSequence(count, rotation, magnitude, linearBias, gyroBias)
@@ -63,6 +68,7 @@ classdef MockImuBrick2 < handle
             acceleration = rotation' * [magnitude;0;0] + linearBias(:);
             sample = MockImuBrick2.makeSample(gravity, acceleration, gyroBias);
             samples = repmat(sample, count, 1);
+            samples = MockImuBrick2.withAdvancingTimestamps(samples, 0.02);
         end
 
         function samples = createTurningSequence(count, rotation, magnitude)
@@ -72,6 +78,7 @@ classdef MockImuBrick2 < handle
             acceleration = rotation' * [magnitude;0;0];
             sample = MockImuBrick2.makeSample(gravity, acceleration, [0;0;20]);
             samples = repmat(sample, count, 1);
+            samples = MockImuBrick2.withAdvancingTimestamps(samples, 0.02);
         end
 
         function sample = makeSample(gravity, linearAcceleration, angularVelocity)
@@ -83,6 +90,14 @@ classdef MockImuBrick2 < handle
                 'magneticField', [0 0 0], 'euler', [0 0 0], ...
                 'quaternion', [1 0 0 0], 'temperature', 20, ...
                 'calibration', struct());
+        end
+
+        function samples = withAdvancingTimestamps(samples, stepSeconds)
+            if nargin < 2, stepSeconds = 0.02; end
+            firstTimestamp = datetime('now');
+            for index = 1:numel(samples)
+                samples(index).timestamp = firstTimestamp + seconds((index - 1) * stepSeconds);
+            end
         end
     end
 end

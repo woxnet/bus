@@ -3,11 +3,26 @@ function config = getImuConfig()
 %   CONFIG contains the device address, acquisition rate and calibration
 %   output settings used by diagnostics and operator-run calibration.
 
+config = struct();
+
 config.uid = "6dKiM3";
 config.host = "localhost";
 config.port = 4223;
+
 config.sampleRateHz = 50;
+config.samplePeriodSeconds = 0.02;
 config.callbackPeriodMs = 20;
-config.calibrationDirectory = "calibration";
+
 config.busId = "bus_001";
+config.calibrationDirectory = "calibration";
+
+config.diagnosticSampleCount = 100;
+config.minimumDiagnosticFrequencyHz = 40;
+config.maximumDiagnosticFrequencyHz = 60;
+
+config.gravityReference = 9.81;
+config.maximumGravityError = 1.5;
+
+config.maxConsecutiveReadErrors = 3;
+config.readRetryDelaySeconds = 0.1;
 end
