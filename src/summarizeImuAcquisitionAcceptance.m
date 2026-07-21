@@ -110,7 +110,12 @@ warnings = strings(0, 1);
 for index = 1:numel(varargin)
     value = varargin{index};
     if isstruct(value) && isfield(value, 'warnings') && ~isempty(value.warnings)
-        warnings = [warnings; string(value.warnings(:))]; %#ok<AGROW>
+        if ischar(value.warnings)
+            incoming = string(value.warnings);
+        else
+            incoming = string(value.warnings(:));
+        end
+        warnings = [warnings; incoming(:)]; %#ok<AGROW>
     end
 end
 end
