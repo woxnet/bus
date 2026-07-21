@@ -27,6 +27,7 @@ classdef ImuBrick2 < handle
 
     methods
         function obj = ImuBrick2(uid, host, port)
+            assertImuRuntimeReady();
             if nargin < 2 || isempty(host)
                 host = 'localhost';
             end

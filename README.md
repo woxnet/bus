@@ -29,6 +29,31 @@ The resulting local file is `lib/Tinkerforge.jar` and is ignored by Git.
 After replacing a JAR that MATLAB has already loaded, restart MATLAB before
 continuing.
 
+## Повторный запуск startup
+
+Run `startup` before creating `ImuBrick2`. It is idempotent, may be called
+repeatedly, leaves the diagnostic structure `imuStartupStatus` in the caller
+workspace, and never creates an `IPConnection` or `BrickIMUV2` object. It
+verifies the code source of every required Java class. If a class is already
+loaded from a different JAR, it sets
+`imuStartupStatus.restartRequired = true` and does not modify the Java
+classpath; close IMU objects and restart MATLAB before connecting again.
+After replacing any loaded JAR, a MATLAB restart is required. A MATLAB
+`not clearing java` warning means that the current process is still using
+previously loaded Java classes.
+
+Applications can enforce this precondition with `assertImuRuntimeReady()`.
+Before replacing a loaded JAR, release an active acquisition object with:
+
+```matlab
+shutdownImuRuntime(imu);
+clear imu;
+clear java; % or restart MATLAB
+```
+
+`shutdownImuRuntime` stops acquisition, clears the callback buffer,
+disconnects, and deletes the MATLAB handle. It does not clear Java itself.
+
 ## Unit tests
 
 The tests use a mock IMU and do not require Brick Daemon or physical hardware:

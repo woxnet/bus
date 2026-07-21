@@ -4,6 +4,13 @@ jarFile = fullfile(projectRoot, 'lib', 'Tinkerforge.jar');
 addpath(fullfile(projectRoot, 'src'));
 addpath(fullfile(projectRoot, 'examples'));
 
-bindingStatus = loadTinkerforgeBindings(jarFile);
+imuStartupStatus = loadTinkerforgeBindings(jarFile);
 
-clear projectRoot jarFile bindingStatus;
+if imuStartupStatus.available
+    fprintf('Tinkerforge bindings готовы.\n');
+elseif imuStartupStatus.restartRequired
+    fprintf(['Tinkerforge Java classes already loaded.\n', ...
+        'Restart MATLAB before connecting the IMU.\n']);
+end
+
+clear projectRoot jarFile;
