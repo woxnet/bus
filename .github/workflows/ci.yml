@@ -7,25 +7,56 @@ on:
 jobs:
   structure-and-java:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: ['8', '17', '21']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - name: Verify repository structure
+        run: |
+          test -z "$(git ls-files -- lib/Tinkerforge.jar)"
+          test -f java/bus/imu/ImuAllDataBuffer.java
+          test -f lib-generated/imu-callback-bridge-v2.jar
+          test -f src/getImuConfig.m
+      - name: Compile and test bounded Java bridge
+        shell: bash
+        run: |
+          mkdir -p build/java
+          if [[ "${{ matrix.java-version }}" == "8" ]]; then
+            FLAGS="-source 1.8 -target 1.8"
+          else
+            FLAGS="--release 8"
+          fi
+          javac $FLAGS -d build/java \
+            java/test/com/tinkerforge/BrickIMUV2.java \
+            java/bus/imu/ImuAllDataBuffer.java \
+            java/test/bus/imu/ImuAllDataBufferTest.java
+          java -ea -cp build/java bus.imu.ImuAllDataBufferTest
+
+  official-tinkerforge-api:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - name: Verify repository structure
+      - name: Download pinned official Tinkerforge API
         run: |
-          test -z "$(git ls-files -- lib/Tinkerforge.jar)"
-          test -f java/bus/imu/ImuAllDataBuffer.java
-          test -f src/getImuConfig.m
-      - name: Compile and test bounded Java bridge
+          curl --fail --location --silent --show-error \
+            --output /tmp/tinkerforge-matlab.zip \
+            https://download.tinkerforge.com/bindings/matlab/tinkerforge_matlab_bindings_2_0_33.zip
+          echo "f1367928962ba4ab27b5046e26ade272e94a0e4a630ce9115c50e2b67a71bfb1  /tmp/tinkerforge-matlab.zip" | sha256sum --check
+          unzip -p /tmp/tinkerforge-matlab.zip matlab/Tinkerforge.jar > /tmp/Tinkerforge.jar
+      - name: Compile bridge against official API
         run: |
-          mkdir -p build/java
-          javac --release 8 -d build/java \
-            java/test/com/tinkerforge/BrickIMUV2.java \
-            java/bus/imu/ImuAllDataBuffer.java \
-            java/test/bus/imu/ImuAllDataBufferTest.java
-          java -ea -cp build/java bus.imu.ImuAllDataBufferTest
+          mkdir -p build/official
+          javac --release 8 -cp /tmp/Tinkerforge.jar \
+            -d build/official java/bus/imu/ImuAllDataBuffer.java
 
   matlab-unit-tests:
     runs-on: ubuntu-latest

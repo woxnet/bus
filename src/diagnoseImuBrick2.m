@@ -58,9 +58,12 @@ report.success = report.jarAvailable && report.jarSizeBytes > 0 && ...
     report.callbackFrequencyHz <= config.maximumDiagnosticFrequencyHz && ...
     report.callbackTimestampsAdvance && report.callbackSequenceAdvances && ...
     report.callbackMissingSequences == 0 && ...
-    report.callbackDroppedSamples <= config.preflightMaximumDroppedSamples && ...
-    report.callbackMaximumAgeMs <= 2 * config.callbackPeriodMs && ...
-    report.callbackRestartClean && ...
+    report.callbackOverflowDropped <= config.maximumPreflightDroppedCallbacks && ...
+    report.callbackStaleSessionDropped == 0 && ...
+    report.callbackMaximumAgeMs <= config.maximumCallbackSampleAgeMs && ...
+    report.callbackBufferCapacity == config.callbackBufferMaximumSize && ...
+    report.callbackPayloadsDecoded >= 100 && ...
+    report.callbackPayloadFieldsValid && report.callbackPayloadValuesFinite && ...
     abs(report.meanGravityMagnitude - config.gravityReference) <= ...
     config.maximumGravityError && abs(report.meanQuaternionNorm - 1) <= 0.1 && ...
     isempty(report.errors);
@@ -126,8 +129,13 @@ end
 
 imu.clearCallbackBuffer();
 imu.start(config.callbackPeriodMs);
-[callback, callbackErrors] = collectCallbacks(imu, config, dependencies.pauseFunction);
+warmUpCallbackDecoder(imu, dependencies.pauseFunction, config.callbackPeriodMs);
+imu.clearCallbackBuffer();
+initialCallbackStats = imu.getCallbackStats();
+[callback, callbackErrors] = collectCallbacks(imu, config, ...
+    dependencies.pauseFunction, initialCallbackStats);
 report.callbackSamplesRead = callback.count;
+report.callbackReceivedTotal = callback.receivedTotal;
 report.callbackFrequencyHz = callback.frequencyHz;
 report.callbackTimestampsAdvance = callback.timestampsAdvance;
 report.callbackSequenceAdvances = callback.sequenceAdvances;
@@ -135,33 +143,65 @@ report.callbackFirstSequence = callback.firstSequence;
 report.callbackLastSequence = callback.lastSequence;
 report.callbackMissingSequences = callback.missingSequences;
 report.callbackDroppedSamples = callback.droppedSamples;
+report.callbackOverflowDropped = callback.overflowDropped;
+report.callbackCoalesced = callback.coalesced;
+report.callbackStaleSessionDropped = callback.staleSessionDropped;
+report.callbackBufferCapacity = callback.bufferCapacity;
+report.callbackMaximumBuffered = callback.maximumBuffered;
+report.callbackMeanAgeMs = callback.meanAgeMs;
 report.callbackMaximumAgeMs = callback.maximumAgeMs;
-report.callbackBufferMaximumSize = config.callbackBufferMaximumSize;
-report.callbackRestartClean = callback.restartClean;
+report.callbackPayloadsDecoded = callback.payloadsDecoded;
+report.callbackPayloadFieldsValid = callback.payloadFieldsValid;
+report.callbackPayloadValuesFinite = callback.payloadValuesFinite;
+report.callbackQuaternionNormMean = callback.quaternionNormMean;
 if ~isempty(callbackErrors), report.errors = [report.errors; callbackErrors]; end
 clear streamCleanup;
 end
 
-function [result, errors] = collectCallbacks(imu, config, pauseFunction)
+function warmUpCallbackDecoder(imu, pauseFunction, periodMs)
+target = 10;
+decoded = 0;
+timer = tic;
+while decoded < target && toc(timer) < max(2, target * periodMs / 1000 * 3)
+    sample = imu.nextCallbackSample();
+    if isempty(sample)
+        pauseFunction(0.001);
+    else
+        decoded = decoded + 1;
+    end
+end
+end
+
+function [result, errors] = collectCallbacks(imu, config, pauseFunction, initialStats)
 count = 100;
 sequences = zeros(count, 1, 'uint64');
 timestamps = zeros(count, 1);
 agesMs = NaN(count, 1);
 received = 0;
+maximumBuffered = 0;
+payloadFieldsValid = true;
+payloadValuesFinite = true;
+quaternionNorms = NaN(count, 1);
 timer = tic;
 timeout = max(5, count * config.callbackPeriodMs / 1000 * 3);
 errors = strings(0, 1);
 while received < count && toc(timer) < timeout
     sampleAvailable = false;
     try
-        sample = imu.nextCallbackMetadata();
+        currentStats = imu.getCallbackStats();
+        maximumBuffered = max(maximumBuffered, double(currentStats.buffered));
+        sample = imu.nextCallbackSample();
         if ~isempty(sample)
             sampleAvailable = true;
             received = received + 1;
             sequences(received) = uint64(sample.sequenceNumber);
-            timestamps(received) = sample.timestampMillis / 1000;
-            agesMs(received) = 1000 * posixtime( ...
-                datetime('now', 'TimeZone', 'UTC')) - sample.timestampMillis;
+            timestamps(received) = double(sample.callbackTimestampNanos) / 1e9;
+            agesMs(received) = sample.callbackAgeMs;
+            [fieldsValid, valuesFinite, quaternionNorm] = ...
+                validateCallbackPayload(sample, initialStats.sessionId);
+            payloadFieldsValid = payloadFieldsValid && fieldsValid;
+            payloadValuesFinite = payloadValuesFinite && valuesFinite;
+            quaternionNorms(received) = quaternionNorm;
         end
     catch exception
         if ~contains(string(exception.identifier), "NotStreaming")
@@ -178,9 +218,19 @@ result.sequenceAdvances = false;
 result.firstSequence = uint64(0);
 result.lastSequence = uint64(0);
 result.missingSequences = Inf;
+result.receivedTotal = 0;
 result.droppedSamples = Inf;
+result.overflowDropped = Inf;
+result.coalesced = Inf;
+result.staleSessionDropped = Inf;
+result.bufferCapacity = double(initialStats.capacity);
+result.maximumBuffered = maximumBuffered;
+result.meanAgeMs = Inf;
 result.maximumAgeMs = Inf;
-result.restartClean = false;
+result.payloadsDecoded = received;
+result.payloadFieldsValid = payloadFieldsValid;
+result.payloadValuesFinite = payloadValuesFinite;
+result.quaternionNormMean = NaN;
 if received >= 2
     elapsed = timestamps(received) - timestamps(1);
     if elapsed > 0, result.frequencyHz = (received - 1) / elapsed; end
@@ -190,11 +240,19 @@ if received >= 2
     result.lastSequence = sequences(received);
     result.missingSequences = sum(max(0, ...
         diff(double(sequences(1:received))) - 1));
+    result.meanAgeMs = mean(agesMs(1:received));
     result.maximumAgeMs = max(agesMs(1:received));
-    result.restartClean = result.firstSequence == uint64(1);
+    result.quaternionNormMean = mean(quaternionNorms(1:received));
 end
 stats = imu.getCallbackStats();
-result.droppedSamples = double(stats.dropped);
+result.receivedTotal = double(stats.received);
+result.overflowDropped = double(stats.overflowDropped);
+result.coalesced = double(stats.coalesced);
+result.staleSessionDropped = double(stats.staleSessionDropped);
+result.droppedSamples = result.overflowDropped;
+result.payloadsDecoded = received;
+result.bufferCapacity = double(stats.capacity);
+result.maximumBuffered = max(result.maximumBuffered, double(stats.buffered));
 if received < count, errors(end+1, 1) = sprintf('Callback: получено %d из %d отсчётов.', received, count); end
 if ~(result.frequencyHz >= config.minimumDiagnosticFrequencyHz && ...
         result.frequencyHz <= config.maximumDiagnosticFrequencyHz)
@@ -203,9 +261,39 @@ end
 if ~result.timestampsAdvance, errors(end+1, 1) = "Callback timestamps не возрастают."; end
 if ~result.sequenceAdvances, errors(end+1, 1) = "Callback sequence numbers не возрастают."; end
 if result.missingSequences ~= 0, errors(end+1, 1) = "Callback sequence contains missing samples."; end
-if result.droppedSamples > config.preflightMaximumDroppedSamples, errors(end+1, 1) = "Callback buffer dropped samples."; end
-if result.maximumAgeMs > 2 * config.callbackPeriodMs, errors(end+1, 1) = "Callback sample is too old."; end
-if ~result.restartClean, errors(end+1, 1) = "Callback restart returned stale session data."; end
+if result.overflowDropped > config.maximumPreflightDroppedCallbacks, errors(end+1, 1) = "Callback buffer overflow dropped samples."; end
+if result.staleSessionDropped > 0, errors(end+1, 1) = "Stale-session callbacks were received."; end
+if result.maximumAgeMs > config.maximumCallbackSampleAgeMs, errors(end+1, 1) = "Callback sample is too old."; end
+if result.bufferCapacity ~= config.callbackBufferMaximumSize, errors(end+1, 1) = "Callback buffer capacity does not match configuration."; end
+if ~result.payloadFieldsValid, errors(end+1, 1) = "Callback payload fields are invalid."; end
+if ~result.payloadValuesFinite, errors(end+1, 1) = "Callback payload contains non-finite values."; end
+if abs(result.quaternionNormMean - 1) > 0.1, errors(end+1, 1) = "Callback quaternion norm is invalid."; end
+end
+
+function [fieldsValid, valuesFinite, quaternionNorm] = validateCallbackPayload(sample, sessionId)
+required = {'gravity','linearAcceleration','angularVelocity','quaternion', ...
+    'temperature','calibration','source','sessionId','sequenceNumber', ...
+    'callbackTimestampNanos'};
+fieldsValid = isstruct(sample) && all(isfield(sample, required));
+valuesFinite = false;
+quaternionNorm = NaN;
+if ~fieldsValid, return; end
+fieldsValid = isequal(size(sample.gravity), [1 3]) && ...
+    isequal(size(sample.linearAcceleration), [1 3]) && ...
+    isequal(size(sample.angularVelocity), [1 3]) && ...
+    isequal(size(sample.quaternion), [1 4]) && isscalar(sample.temperature) && ...
+    string(sample.source) == "callback" && ...
+    uint64(sample.sessionId) == uint64(sessionId) && ...
+    isscalar(sample.sequenceNumber) && isstruct(sample.calibration);
+calibrationFields = {'magnetometer','accelerometer','gyroscope','system'};
+fieldsValid = fieldsValid && all(isfield(sample.calibration, calibrationFields));
+if ~fieldsValid, return; end
+numeric = [sample.gravity(:); sample.linearAcceleration(:); ...
+    sample.angularVelocity(:); sample.quaternion(:); sample.temperature; ...
+    sample.calibration.magnetometer; sample.calibration.accelerometer; ...
+    sample.calibration.gyroscope; sample.calibration.system];
+valuesFinite = isnumeric(numeric) && all(isfinite(numeric));
+quaternionNorm = norm(sample.quaternion);
 end
 
 function restoreStream(imu, wasStreaming, previousPeriod)
@@ -220,6 +308,7 @@ end
 
 function report = createReport(config)
 report = struct('success', false, 'uid', config.uid, 'host', config.host, ...
+    'generatedAt', datetime('now', 'TimeZone', 'UTC'), ...
     'port', config.port, 'jarAvailable', false, 'jarSizeBytes', 0, ...
     'jarSignatureValid', false, 'javaBindingsAvailable', false, ...
     'brickDaemonConnected', false, 'imuConnected', false, ...
@@ -236,9 +325,15 @@ report = struct('success', false, 'uid', config.uid, 'host', config.host, ...
     'callbackFrequencyHz', NaN, 'callbackTimestampsAdvance', false, ...
     'callbackSequenceAdvances', false, 'callbackFirstSequence', uint64(0), ...
     'callbackLastSequence', uint64(0), 'callbackMissingSequences', Inf, ...
-    'callbackDroppedSamples', Inf, 'callbackMaximumAgeMs', Inf, ...
-    'callbackBufferMaximumSize', config.callbackBufferMaximumSize, ...
-    'callbackRestartClean', false, 'meanQuaternionNorm', NaN, ...
+    'callbackReceivedTotal', 0, 'callbackDroppedSamples', Inf, ...
+    'callbackOverflowDropped', Inf, 'callbackCoalesced', Inf, ...
+    'callbackStaleSessionDropped', Inf, ...
+    'callbackBufferCapacity', NaN, ...
+    'callbackMaximumBuffered', 0, 'callbackMeanAgeMs', Inf, ...
+    'callbackMaximumAgeMs', Inf, 'callbackPayloadsDecoded', 0, ...
+    'callbackPayloadFieldsValid', false, ...
+    'callbackPayloadValuesFinite', false, ...
+    'callbackQuaternionNormMean', NaN, 'meanQuaternionNorm', NaN, ...
     'calibrationStatus', struct(), 'errors', strings(0, 1), ...
     'warnings', strings(0, 1));
 end

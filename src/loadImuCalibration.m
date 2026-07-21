@@ -6,15 +6,17 @@ function calibration = loadImuCalibration(filename, expectedBusId, expectedImuUi
 if nargin < 2, expectedBusId = ""; end
 if nargin < 3, expectedImuUid = ""; end
 if (ischar(expectedBusId) || isstring(expectedBusId)) && ...
-        strcmpi(string(expectedBusId), "AllowLegacy")
+        any(strcmpi(string(expectedBusId), ["AllowLegacy", "AllowSynthetic"]))
     varargin = [{expectedBusId, expectedImuUid}, varargin];
     expectedBusId = "";
     expectedImuUid = "";
 end
 parser = inputParser;
 addParameter(parser, 'AllowLegacy', false, @(value)islogical(value) && isscalar(value));
+addParameter(parser, 'AllowSynthetic', false, @(value)islogical(value) && isscalar(value));
 parse(parser, varargin{:});
 allowLegacy = parser.Results.AllowLegacy;
+allowSynthetic = parser.Results.AllowSynthetic;
 
 try
     if ~(ischar(filename) || (isstring(filename) && isscalar(filename))) || ...
@@ -27,7 +29,8 @@ try
     end
     contents = load(filename, 'calibration');
     calibration = contents.calibration;
-    report = validateImuCalibration(calibration, allowLegacy);
+    report = validateImuCalibration(calibration, 'AllowLegacy', allowLegacy, ...
+        'AllowSynthetic', allowSynthetic);
     if ~report.valid
         error('%s', strjoin(report.errors, ' '));
     end

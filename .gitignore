@@ -3,3 +3,6 @@ calibration/
 *.asv
 *.mat
 .build/
+artifacts/
+sessions/
+lib-generated/imu-callback-bridge.jar

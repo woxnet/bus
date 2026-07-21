@@ -1,10 +1,18 @@
-function report = validateImuCalibration(calibration, allowLegacy)
+function report = validateImuCalibration(calibration, varargin)
 %VALIDATEIMUCALIBRATION Validate an IMU installation calibration structure.
 %   REPORT = VALIDATEIMUCALIBRATION(CALIBRATION) returns REPORT.valid,
 %   REPORT.errors and REPORT.warnings without throwing for normal invalid data.
 
 report = struct('valid', false, 'errors', {{}}, 'warnings', {{}});
-if nargin < 2, allowLegacy = false; end
+if ~isempty(varargin) && islogical(varargin{1})
+    varargin = [{'AllowLegacy', varargin{1}}, varargin(2:end)];
+end
+parser = inputParser;
+parser.addParameter('AllowLegacy', false, @(value)islogical(value) && isscalar(value));
+parser.addParameter('AllowSynthetic', false, @(value)islogical(value) && isscalar(value));
+parser.parse(varargin{:});
+allowLegacy = parser.Results.AllowLegacy;
+allowSynthetic = parser.Results.AllowSynthetic;
 try
     if ~isstruct(calibration) || ~isscalar(calibration)
         report.errors{end+1} = 'Calibration must be a scalar structure.';
@@ -30,7 +38,7 @@ try
             report.errors{end+1} = 'Version 2 calibration requires metadata.';
         else
             metadataFields = {'busId','imuUid','deviceIdentifier','firmwareVersion', ...
-                'sensorFusionMode','sampleRateHz','algorithmVersion'};
+                'sensorFusionMode','sampleRateHz','algorithmVersion','synthetic'};
             for metadataIndex = 1:numel(metadataFields)
                 if ~isfield(calibration.metadata, metadataFields{metadataIndex})
                     report.errors{end+1} = ['Missing metadata field: ', ...
@@ -67,6 +75,12 @@ try
                 if ~(isTextScalar(metadata.algorithmVersion) && ...
                         strlength(string(metadata.algorithmVersion)) > 0)
                     report.errors{end+1} = 'metadata.algorithmVersion must be nonempty.';
+                end
+                if ~(islogical(metadata.synthetic) && isscalar(metadata.synthetic))
+                    report.errors{end+1} = 'metadata.synthetic must be a logical scalar.';
+                elseif metadata.synthetic && ~allowSynthetic
+                    report.errors{end+1} = ...
+                        'Synthetic calibration requires AllowSynthetic=true.';
                 end
             end
         end

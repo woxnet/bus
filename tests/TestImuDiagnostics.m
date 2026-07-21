@@ -80,6 +80,16 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             testCase.verifyTrue(report.callbackSequenceAdvances);
             testCase.verifyEqual(report.callbackMissingSequences, 0);
             testCase.verifyEqual(report.callbackDroppedSamples, 0);
+            testCase.verifyEqual(report.callbackOverflowDropped, 0);
+            testCase.verifyEqual(report.callbackCoalesced, 0);
+            testCase.verifyEqual(report.callbackStaleSessionDropped, 0);
+            testCase.verifyEqual(report.callbackPayloadsDecoded, 100);
+            testCase.verifyTrue(report.callbackPayloadFieldsValid);
+            testCase.verifyTrue(report.callbackPayloadValuesFinite);
+            testCase.verifyGreaterThanOrEqual(report.callbackReceivedTotal, 100);
+            testCase.verifyEqual(report.callbackBufferCapacity, 256);
+            testCase.verifyGreaterThan(report.callbackMaximumBuffered, 0);
+            testCase.verifyGreaterThanOrEqual(report.callbackMeanAgeMs, 0);
             testCase.verifyLessThanOrEqual(report.callbackMaximumAgeMs, 40);
         end
 
@@ -88,6 +98,13 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             report = diagnoseImuBrick2(imu, testCase.dependencies());
             testCase.verifyFalse(report.success);
             testCase.verifyGreaterThan(report.callbackMissingSequences, 0);
+        end
+
+        function callbackCapacityMismatchRejected(testCase)
+            imu = testCase.hardwareMock(); imu.ReportedCallbackCapacity = 128;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyEqual(report.callbackBufferCapacity, 128);
         end
 
         function staleCallbackRejected(testCase)
@@ -104,11 +121,18 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             testCase.verifyEqual(report.callbackDroppedSamples, 1);
         end
 
-        function staleSessionSequenceRejected(testCase)
-            imu = testCase.hardwareMock(); imu.CallbackSequenceStart = 100;
+        function staleSessionDropRejected(testCase)
+            imu = testCase.hardwareMock(); imu.InjectedStaleSessionDrops = 1;
             report = diagnoseImuBrick2(imu, testCase.dependencies());
             testCase.verifyFalse(report.success);
-            testCase.verifyFalse(report.callbackRestartClean);
+            testCase.verifyEqual(report.callbackStaleSessionDropped, 1);
+        end
+
+        function intentionalCoalescingDoesNotFailPreflight(testCase)
+            imu = testCase.hardwareMock(); imu.InjectedCoalescedSamples = 2;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyTrue(report.success);
+            testCase.verifyEqual(report.callbackCoalesced, 2);
         end
 
         function latestAndSequentialDrainSemantics(testCase)
@@ -116,19 +140,24 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             newest = imu.latest();
             testCase.verifyEqual(newest.sequenceNumber, imu.LastCallbackSequence);
             testCase.verifyEqual(imu.CallbackBufferedCount, uint64(0));
+            imu.FreezeCallback = true;
+            testCase.verifyError(@()imu.latest(), 'IMU:NoNewCallbackSample');
+            imu.FreezeCallback = false;
             imu.stop(); imu.start(1); pause(0.005);
             samples = imu.drainCallbackSamples(3);
             sequences = cellfun(@(sample)double(sample.sequenceNumber), samples);
-            testCase.verifyEqual(sequences, (1:numel(samples)).');
+            testCase.verifyEqual(diff(sequences), ones(numel(samples)-1, 1));
         end
 
         function stopStartClearsOldCallbacks(testCase)
             imu = testCase.hardwareMock(); imu.start(1); pause(0.005);
-            old = imu.nextCallbackSample(); %#ok<NASGU>
+            old = imu.nextCallbackSample();
+            oldSession = old.sessionId;
             imu.stop(); imu.start(1); pause(0.002);
             fresh = imu.nextCallbackSample();
             testCase.verifyEqual(fresh.sequenceNumber, uint64(1));
-            testCase.verifyEqual(fresh.callbackDroppedBeforeSample, uint64(0));
+            testCase.verifyGreaterThan(fresh.sessionId, oldSession);
+            testCase.verifyEqual(fresh.callbackDroppedTotal, uint64(0));
         end
 
         function frozenCallbackRejected(testCase)
