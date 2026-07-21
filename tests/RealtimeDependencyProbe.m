@@ -15,6 +15,7 @@ classdef RealtimeDependencyProbe < handle
         Timers=FakeRealtimeTimer.empty
         ClockElapsed=1
         ClockStep=0
+        SleepCalls=0
     end
     methods
         function value=dependencies(obj)
@@ -23,7 +24,8 @@ classdef RealtimeDependencyProbe < handle
                 'createDashboard',@(monitor)obj.createDashboard(monitor), ...
                 'createRecorder',@(imu,calibration,options)obj.createRecorder(imu,calibration,options), ...
                 'monotonicClockStart',@()uint64(1), ...
-                'monotonicClockElapsed',@(~)obj.elapsed());
+                'monotonicClockElapsed',@(~)obj.elapsed(), ...
+                'sleep',@(seconds)obj.sleep(seconds));
         end
         function assertRuntime(obj)
             obj.RuntimeCalls=obj.RuntimeCalls+1;
@@ -41,10 +43,18 @@ classdef RealtimeDependencyProbe < handle
         end
         function recorder=createRecorder(obj,imu,~,~)
             if obj.FailRecorderCreate, error('Test:RecorderCreateFailure','Injected recorder creation failure.'); end
-            recorder=FakeRealtimeRecorder(imu,obj.FailRecorderStart,obj.FailRecorderStop); obj.Recorder=recorder;
+            recorder=FakeRealtimeRecorder(imu,obj.FailRecorderStart,obj.FailRecorderStop, ...
+                @(seconds)obj.advanceClock(seconds)); obj.Recorder=recorder;
         end
         function value=elapsed(obj)
             value=obj.ClockElapsed; obj.ClockElapsed=obj.ClockElapsed+obj.ClockStep;
+        end
+        function sleep(obj,seconds)
+            obj.SleepCalls=obj.SleepCalls+1;
+            obj.advanceClock(seconds);
+        end
+        function advanceClock(obj,seconds)
+            obj.ClockElapsed=obj.ClockElapsed+double(seconds);
         end
     end
 end

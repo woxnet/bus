@@ -42,6 +42,9 @@ classdef MockImuBrick2 < handle
         FailStart = false
         FailQuiesce = false
         FailClear = false
+        DelayedTailSamples = struct.empty
+        InjectTailAfterEmptyDrainCount = Inf
+        InjectOverflowOnStatsCall = Inf
     end
     properties (Access = private)
         Index = 1
@@ -50,6 +53,8 @@ classdef MockImuBrick2 < handle
         CallbackQueue = cell(0, 1)
         CallbackGeneratedCount = 0
         CallbackBufferCapacity = 256
+        EmptyDrainCount = 0
+        StatsCallCount = 0
     end
 
     methods
@@ -145,12 +150,19 @@ classdef MockImuBrick2 < handle
         function samples = drainCallbackSamples(obj, maxCount)
             obj.DrainCallCount = obj.DrainCallCount + 1;
             if nargin < 2, maxCount = Inf; end
+            if isempty(obj.CallbackQueue) && ~obj.IsStreaming && ...
+                    ~isempty(obj.DelayedTailSamples) && ...
+                    obj.EmptyDrainCount >= obj.InjectTailAfterEmptyDrainCount
+                obj.enqueueDelayedTail();
+            end
             samples = cell(0, 1);
             while numel(samples) < maxCount
                 sample = obj.nextCallbackSample();
                 if isempty(sample), break; end
                 samples{end+1, 1} = sample; %#ok<AGROW>
             end
+            if isempty(samples), obj.EmptyDrainCount=obj.EmptyDrainCount+1;
+            else, obj.EmptyDrainCount=0; end
         end
         function injectCallbackSamples(obj, samples, sequences, callbackAgeMs)
             if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
@@ -201,9 +213,17 @@ classdef MockImuBrick2 < handle
             obj.CallbackBufferedCount = uint64(0);
             obj.LastCallbackSequence = uint64(0);
             obj.LatestData = [];
+            obj.EmptyDrainCount = 0;
+            obj.StatsCallCount = 0;
         end
         function stats = getCallbackStats(obj)
             obj.updateCallbacks();
+            obj.StatsCallCount = obj.StatsCallCount + 1;
+            if obj.StatsCallCount == obj.InjectOverflowOnStatsCall
+                obj.CallbackOverflowDroppedCount = ...
+                    obj.CallbackOverflowDroppedCount + uint64(1);
+                obj.CallbackDroppedCount = obj.CallbackOverflowDroppedCount;
+            end
             stats = struct('received', obj.CallbackReceivedCount, ...
                 'dropped', obj.CallbackDroppedCount, ...
                 'overflowDropped', obj.CallbackOverflowDroppedCount, ...
@@ -228,6 +248,28 @@ classdef MockImuBrick2 < handle
     end
 
     methods (Access = private)
+        function enqueueDelayedTail(obj)
+            samples=obj.DelayedTailSamples; obj.DelayedTailSamples=struct.empty;
+            for index=1:numel(samples)
+                sample=samples(index); sample.source="callback";
+                sample.sessionId=obj.CallbackSessionId;
+                obj.LastCallbackSequence=obj.LastCallbackSequence+uint64(1);
+                sample.sequenceNumber=obj.LastCallbackSequence;
+                if ~isfield(sample,'hostTimestamp')
+                    sample.hostTimestamp=datetime('now','TimeZone','UTC');
+                end
+                if isempty(sample.hostTimestamp.TimeZone), sample.hostTimestamp.TimeZone='UTC'; end
+                sample.timestamp=sample.hostTimestamp; sample.callbackAgeMs=0;
+                sample.callbackDroppedTotal=obj.CallbackOverflowDroppedCount;
+                sample.callbackOverflowDroppedTotal=obj.CallbackOverflowDroppedCount;
+                sample.callbackCoalescedTotal=obj.CallbackCoalescedCount;
+                sample.callbackStaleSessionDroppedTotal=obj.CallbackStaleSessionDropCount;
+                obj.CallbackQueue{end+1,1}=sample;
+                obj.CallbackGeneratedCount=obj.CallbackGeneratedCount+1;
+                obj.CallbackReceivedCount=obj.CallbackReceivedCount+uint64(1);
+            end
+            obj.CallbackBufferedCount=uint64(numel(obj.CallbackQueue));
+        end
         function updateCallbacks(obj)
             if ~obj.IsStreaming, return; end
             due = obj.StreamingPeriodMs / 1000 * obj.CallbackPeriodScale;

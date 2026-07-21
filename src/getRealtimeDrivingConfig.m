@@ -34,6 +34,7 @@ config.stopOnSequenceGap = false;
 config.maximumConsecutiveErrors = 3;
 config.stopDrainTimeoutSeconds = 0.50;
 config.stopDrainEmptyPasses = 3;
+config.stopDrainPollIntervalSeconds = 0.005;
 config.enableLivePlot = true;
 config.plotRefreshHz = 10;
 config.enableRecording = false;

@@ -60,7 +60,9 @@ classdef RealtimeDrivingMonitor < handle
         VerticalCalmSamples=0
         StaleSessionDropped=0
         MonitorClock=[]
-        FinalDurationSeconds=0
+        AcquisitionDurationSeconds=0
+        ShutdownDurationSeconds=0
+        FinalCallbackStats=[]
         OverflowSincePreviousPoll=false
         IsStopping=false
         InternalErrors=strings(0,1)
@@ -169,7 +171,7 @@ classdef RealtimeDrivingMonitor < handle
             end
             obj.IsStopping=true;
             safety=onCleanup(@()obj.forceStoppedState());
-            tailSamples=0; drainDuration=0; recording=[];
+            tailSamples=0; drainDuration=0; drainTimedOut=false; recording=[];
             try
                 obj.stopTimer();
             catch exception
@@ -182,6 +184,7 @@ classdef RealtimeDrivingMonitor < handle
             end
             try
                 obj.Imu.quiesce();
+                obj.AcquisitionDurationSeconds=obj.monotonicElapsed();
             catch exception
                 obj.recordInternalError(exception);
             end
@@ -190,14 +193,16 @@ classdef RealtimeDrivingMonitor < handle
             catch exception
                 drainTimedOut=true; obj.recordInternalError(exception);
             end
-            try
-                obj.finishActiveEvents("monitor_stop",0); obj.flushPendingEvents();
-            catch exception
-                obj.recordInternalError(exception);
-            end
             finalStats=[];
             try
                 finalStats=obj.Imu.getCallbackStats();
+                obj.FinalCallbackStats=finalStats;
+                obj.observeCallbackStats(finalStats);
+            catch exception
+                obj.recordInternalError(exception);
+            end
+            try
+                obj.finishActiveEvents("monitor_stop",0); obj.flushPendingEvents();
             catch exception
                 obj.recordInternalError(exception);
             end
@@ -223,7 +228,11 @@ classdef RealtimeDrivingMonitor < handle
             catch exception
                 obj.recordInternalError(exception);
             end
-            obj.FinalDurationSeconds=obj.monotonicElapsed();
+            if obj.AcquisitionDurationSeconds<=0
+                obj.AcquisitionDurationSeconds=obj.monotonicElapsed();
+            end
+            obj.ShutdownDurationSeconds=max(0, ...
+                obj.monotonicElapsed()-obj.AcquisitionDurationSeconds);
             obj.StoppedAt=datetime('now','TimeZone','UTC'); obj.IsRunning=false;
             summary=obj.makeSummary(recording,tailSamples,drainDuration,drainTimedOut);
             obj.LastStopSummary=summary; obj.IsStopping=false; clear safety;
@@ -244,7 +253,9 @@ classdef RealtimeDrivingMonitor < handle
             obj.LatestProcessedSample=[]; obj.LatestEvent=[]; obj.LatestDataQualityEvent=[];
             obj.StartedAt=NaT; obj.StoppedAt=NaT; obj.LastError=[];
             obj.ConsecutiveErrors=0; obj.VerticalCalmSamples=0; obj.MonitorClock=[];
-            obj.FinalDurationSeconds=0; obj.OverflowSincePreviousPoll=false;
+            obj.AcquisitionDurationSeconds=0; obj.ShutdownDurationSeconds=0;
+            obj.FinalCallbackStats=[];
+            obj.OverflowSincePreviousPoll=false;
             obj.InternalErrors=strings(0,1); obj.InternalWarnings=strings(0,1);
             obj.LastStopSummary=[]; obj.StoppedCallbackInvoked=false;
             obj.Recorder=[]; obj.OwnsRecorder=false; obj.Dashboard=[]; obj.Timer=[];
@@ -297,7 +308,8 @@ classdef RealtimeDrivingMonitor < handle
                 'createTimer',@timer, ...
                 'createDashboard',@(monitor)RealtimeDrivingDashboard(monitor), ...
                 'createRecorder',@(imu,calibration,options)ImuSessionRecorder(imu,calibration,options), ...
-                'monotonicClockStart',@tic,'monotonicClockElapsed',@toc);
+                'monotonicClockStart',@tic,'monotonicClockElapsed',@toc, ...
+                'sleep',@pause);
             if ~isstruct(custom) || ~isscalar(custom)
                 error('IMU:InvalidRealtimeDependencies','dependencies must be a scalar struct.');
             end
@@ -358,7 +370,7 @@ classdef RealtimeDrivingMonitor < handle
         end
         function processSample(obj,sensor,overflowFlag)
             if nargin<3, overflowFlag=false; end
-            if ~obj.validCallbackMetadata(sensor)
+            if ~obj.validSequenceMetadata(sensor)
                 obj.handleInvalidSample("INVALID_CALLBACK_METADATA",[]); return;
             end
             if uint64(sensor.sessionId)~=obj.StreamSessionId
@@ -377,6 +389,9 @@ classdef RealtimeDrivingMonitor < handle
             end
             if obj.FirstSequence==0, obj.FirstSequence=sequence; end
             obj.LastSequence=sequence;
+            if ~obj.validSampleMetadata(sensor)
+                obj.handleInvalidSample("INVALID_CALLBACK_METADATA",[]); return;
+            end
             late=double(sensor.callbackAgeMs)>obj.Config.maximumSampleAgeMs;
             obj.LateSamples=obj.LateSamples+double(late);
             obj.MaximumCallbackAgeMs=max(obj.MaximumCallbackAgeMs,double(sensor.callbackAgeMs));
@@ -398,17 +413,20 @@ classdef RealtimeDrivingMonitor < handle
             if ~isempty(obj.Dashboard), obj.Dashboard.update(processed); end
             obj.invokeCallback(obj.OnSample,processed);
         end
-        function valid=validCallbackMetadata(~,sample)
-            required={'sessionId','sequenceNumber','callbackAgeMs','hostTimestamp'};
+        function valid=validSequenceMetadata(~,sample)
+            required={'sessionId','sequenceNumber','hostTimestamp'};
             valid=isstruct(sample) && isscalar(sample) && all(isfield(sample,required));
             if ~valid, return; end
             valid=isnumeric(sample.sessionId) && isscalar(sample.sessionId) && ...
                 isfinite(double(sample.sessionId)) && double(sample.sessionId)>=0 && ...
                 isnumeric(sample.sequenceNumber) && isscalar(sample.sequenceNumber) && ...
                 isfinite(double(sample.sequenceNumber)) && double(sample.sequenceNumber)>=1 && ...
-                isnumeric(sample.callbackAgeMs) && isscalar(sample.callbackAgeMs) && ...
-                isfinite(double(sample.callbackAgeMs)) && double(sample.callbackAgeMs)>=0 && ...
                 isa(sample.hostTimestamp,'datetime') && isscalar(sample.hostTimestamp) && ~isnat(sample.hostTimestamp);
+        end
+        function valid=validSampleMetadata(~,sample)
+            valid=isfield(sample,'callbackAgeMs') && isnumeric(sample.callbackAgeMs) && ...
+                isscalar(sample.callbackAgeMs) && isfinite(double(sample.callbackAgeMs)) && ...
+                double(sample.callbackAgeMs)>=0;
         end
         function handleInvalidSample(obj,type,exception)
             obj.InvalidSamples=obj.InvalidSamples+1;
@@ -509,16 +527,23 @@ classdef RealtimeDrivingMonitor < handle
                 1/obj.Config.sampleRateHz;
             merged.meanAcceleration=(first.meanAcceleration*first.sampleCount+ ...
                 second.meanAcceleration*second.sampleCount)/max(1,total);
-            if abs(second.peakAcceleration)>abs(first.peakAcceleration), merged.peakAcceleration=second.peakAcceleration; end
+            merged.peakAcceleration=obj.selectPeakByAbsoluteValue( ...
+                first.peakAcceleration,second.peakAcceleration);
             merged.peakAbsoluteAcceleration=max(first.peakAbsoluteAcceleration,second.peakAbsoluteAcceleration);
-            if abs(second.peakJerk)>abs(first.peakJerk), merged.peakJerk=second.peakJerk; end
-            if abs(second.peakYawRate)>abs(first.peakYawRate), merged.peakYawRate=second.peakYawRate; end
+            merged.peakJerk=obj.selectPeakByAbsoluteValue(first.peakJerk,second.peakJerk);
+            merged.peakYawRate=obj.selectPeakByAbsoluteValue(first.peakYawRate,second.peakYawRate);
             merged.integratedAcceleration=first.integratedAcceleration+second.integratedAcceleration;
             merged.sampleCount=total; merged.missingSamplesInside=first.missingSamplesInside+second.missingSamplesInside;
             merged.outlierSamplesInside=first.outlierSamplesInside+second.outlierSamplesInside;
             merged.maximumCallbackAgeMs=max(first.maximumCallbackAgeMs,second.maximumCallbackAgeMs);
             merged.dataQuality=min(first.dataQuality,second.dataQuality);
             merged.terminationReason=second.terminationReason;
+        end
+        function peak=selectPeakByAbsoluteValue(~,firstPeak,secondPeak)
+            if ~isfinite(firstPeak), peak=secondPeak; return; end
+            if ~isfinite(secondPeak), peak=firstPeak; return; end
+            peak=firstPeak;
+            if abs(secondPeak)>abs(firstPeak), peak=secondPeak; end
         end
         function index=eventTypeIndex(~,type)
             types=["BRAKING_CANDIDATE","ACCELERATION_CANDIDATE","TURN_LEFT_CANDIDATE", ...
@@ -535,13 +560,17 @@ classdef RealtimeDrivingMonitor < handle
             obj.SampleHistoryCount=min(obj.SampleHistoryCount+1,numel(obj.SampleHistory));
         end
         function [count,duration,timedOut]=drainTail(obj)
-            count=0; emptyPasses=0; startTime=obj.monotonicElapsed(); passes=0;
-            maximumPasses=max(obj.Config.stopDrainEmptyPasses+1, ...
-                ceil(obj.Config.stopDrainTimeoutSeconds/max(eps,obj.Config.pollPeriodSeconds))+1);
-            while emptyPasses<obj.Config.stopDrainEmptyPasses && passes<maximumPasses
+            count=0; emptyPasses=0; startTime=obj.monotonicElapsed();
+            while emptyPasses<obj.Config.stopDrainEmptyPasses
                 if obj.monotonicElapsed()-startTime>=obj.Config.stopDrainTimeoutSeconds, break; end
-                samples=obj.Imu.drainCallbackSamples(obj.Config.maximumPollSamples); passes=passes+1;
-                if isempty(samples), emptyPasses=emptyPasses+1; continue; end
+                samples=obj.Imu.drainCallbackSamples(obj.Config.maximumPollSamples);
+                if isempty(samples)
+                    emptyPasses=emptyPasses+1;
+                    if emptyPasses<obj.Config.stopDrainEmptyPasses
+                        obj.Dependencies.sleep(obj.Config.stopDrainPollIntervalSeconds);
+                    end
+                    continue;
+                end
                 emptyPasses=0;
                 for index=1:numel(samples), obj.processSample(samples{index},obj.OverflowSincePreviousPoll); end
                 count=count+numel(samples); obj.OverflowSincePreviousPoll=false;
@@ -554,8 +583,8 @@ classdef RealtimeDrivingMonitor < handle
             elapsed=obj.Dependencies.monotonicClockElapsed; duration=double(elapsed(obj.MonitorClock));
         end
         function summary=makeSummary(obj,recording,tailSamples,drainDuration,drainTimedOut)
-            duration=obj.FinalDurationSeconds;
-            if obj.IsRunning, duration=obj.monotonicElapsed(); end
+            duration=obj.AcquisitionDurationSeconds;
+            if obj.IsRunning && ~obj.IsStopping, duration=obj.monotonicElapsed(); end
             frequency=0; if duration>0, frequency=obj.SamplesProcessed/duration; end
             success=isempty(obj.InternalErrors) && ~drainTimedOut;
             summary=struct('success',success,'errors',obj.InternalErrors,'warnings',obj.InternalWarnings, ...
@@ -565,11 +594,14 @@ classdef RealtimeDrivingMonitor < handle
                 'invalidSamples',obj.InvalidSamples,'lateSamples',obj.LateSamples, ...
                 'overflowDropped',obj.OverflowDropped,'maximumCallbackAgeMs',obj.MaximumCallbackAgeMs, ...
                 'staleSessionDropped',obj.StaleSessionDropped,'lastSequence',obj.LastSequence, ...
-                'durationSeconds',duration,'averageFrequencyHz',frequency, ...
+                'durationSeconds',duration,'acquisitionDurationSeconds',duration, ...
+                'shutdownDurationSeconds',obj.ShutdownDurationSeconds, ...
+                'averageFrequencyHz',frequency, ...
                 'startedAt',obj.StartedAt,'stoppedAt',obj.StoppedAt, ...
                 'sampleHistoryCount',obj.SampleHistoryCount,'eventHistoryCount',obj.EventHistoryCount, ...
                 'tailSamplesDrained',double(tailSamples),'stopDrainDurationSeconds',double(drainDuration), ...
                 'stopDrainTimedOut',logical(drainTimedOut),'recording',recording,'lastError',obj.LastError);
+            summary.finalCallbackStats=obj.FinalCallbackStats;
         end
         function recordInternalError(obj,exception)
             obj.LastError=exception;

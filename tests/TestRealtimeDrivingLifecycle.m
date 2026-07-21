@@ -16,6 +16,15 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
             [monitor,~,cleanup]=testCase.monitor(RealtimeDependencyProbe()); %#ok<ASGLU>
             monitor.startManual(); testCase.verifyTrue(monitor.IsRunning);
         end
+        function drainPollIntervalMustFitTimeout(testCase)
+            config=getRealtimeDrivingConfig();
+            config.stopDrainPollIntervalSeconds=0;
+            testCase.verifyError(@()validateRealtimeDrivingConfig(config), ...
+                'MATLAB:validateRealtimeDrivingConfig:expectedPositive');
+            config.stopDrainPollIntervalSeconds=config.stopDrainTimeoutSeconds+eps;
+            testCase.verifyError(@()validateRealtimeDrivingConfig(config), ...
+                'IMU:InvalidRealtimeConfig');
+        end
         function runtimeFailureRollsBack(testCase)
             probe=RealtimeDependencyProbe(); probe.FailRuntime=true;
             testCase.verifyStartFailure(probe,struct(),'Test:RuntimeFailure');
@@ -68,6 +77,43 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
             testCase.verifyFalse(probe.Recorder.FinalizedWhileStreaming);
             testCase.verifyFalse(summary.stopDrainTimedOut); testCase.verifyTrue(summary.success);
         end
+        function delayedInFlightTailArrivesBetweenEmptyDrains(testCase)
+            probe=RealtimeDependencyProbe();
+            [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableRecording',true)); %#ok<ASGLU>
+            monitor.startManual();
+            imu.DelayedTailSamples=testCase.samples(1,0,0,0);
+            imu.InjectTailAfterEmptyDrainCount=1;
+            summary=monitor.stop();
+            testCase.verifyEqual(summary.tailSamplesDrained,1);
+            testCase.verifyEqual(summary.samplesProcessed,1);
+            testCase.verifyEqual(summary.lastSequence,uint64(1));
+            testCase.verifyEqual(probe.Recorder.AppendedCount,1);
+            testCase.verifyGreaterThan(probe.SleepCalls,0);
+            testCase.verifyFalse(summary.stopDrainTimedOut);
+        end
+        function delayedTailAfterTimeoutFailsStop(testCase)
+            probe=RealtimeDependencyProbe();
+            options=struct('stopDrainTimeoutSeconds',0.01, ...
+                'stopDrainPollIntervalSeconds',0.005,'stopDrainEmptyPasses',10);
+            [monitor,imu,cleanup]=testCase.monitor(probe,options); %#ok<ASGLU>
+            monitor.startManual(); imu.DelayedTailSamples=testCase.samples(1,0,0,0);
+            imu.InjectTailAfterEmptyDrainCount=3;
+            summary=monitor.stop();
+            testCase.verifyTrue(summary.stopDrainTimedOut);
+            testCase.verifyFalse(summary.success);
+            testCase.verifyEqual(summary.tailSamplesDrained,0);
+        end
+        function finalCallbackStatsCaptureStopRace(testCase)
+            probe=RealtimeDependencyProbe();
+            [monitor,imu,cleanup]=testCase.monitor(probe); %#ok<ASGLU>
+            monitor.startManual(); imu.InjectOverflowOnStatsCall=3;
+            imu.injectCallbackSamples(testCase.samples(25,-3,0,0));
+            summary=monitor.stop();
+            testCase.verifyGreaterThan(summary.overflowDropped,0);
+            testCase.verifyTrue(any(summary.warnings=="CALLBACK_OVERFLOW"));
+            events=monitor.getRecentEvents();
+            testCase.verifyEqual(events(1).terminationReason,"overflow");
+        end
         function recorderFinalizationFailureIsUnsuccessful(testCase)
             probe=RealtimeDependencyProbe(); probe.FailRecorderStop=true;
             callback=RealtimeCallbackProbe();
@@ -83,6 +129,20 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
             monitor.startManual(); imu.injectCallbackSamples(testCase.samples(50,0,0,0)); monitor.poll();
             stats=monitor.getStats(); testCase.verifyEqual(stats.durationSeconds,2);
             testCase.verifyEqual(stats.averageFrequencyHz,25);
+        end
+        function slowRecorderDoesNotReduceAcquisitionFrequency(testCase)
+            probe=RealtimeDependencyProbe(); probe.ClockElapsed=2;
+            [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableRecording',true)); %#ok<ASGLU>
+            monitor.startManual(); probe.Recorder.StopDelaySeconds=10;
+            imu.injectCallbackSamples(testCase.samples(100,0,0,0)); monitor.poll();
+            summary=monitor.stop();
+            testCase.verifyEqual(summary.averageFrequencyHz,50,'AbsTol',1e-12);
+            testCase.verifyEqual(summary.acquisitionDurationSeconds,2,'AbsTol',1e-12);
+            testCase.verifyGreaterThanOrEqual(summary.shutdownDurationSeconds,10);
+            testCase.verifyEqual(summary.recording.received,100);
+            testCase.verifyEqual(summary.recording.received, ...
+                double(summary.finalCallbackStats.received));
+            testCase.verifyEqual(summary.recording.samplesWritten,summary.samplesProcessed);
         end
         function repeatedTimerCyclesDoNotLeak(testCase)
             probe=RealtimeDependencyProbe(); [monitor,imu,cleanup]=testCase.monitor(probe,struct('UseTimer',true)); %#ok<ASGLU>
@@ -112,6 +172,16 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
             testCase.verifyEqual(events(1).terminationReason,"invalid_sample");
             history=monitor.getRecentSamples();
             testCase.verifyTrue(all([history.dataValid]));
+        end
+        function invalidPayloadAdvancesTrustedSequence(testCase)
+            [monitor,imu,cleanup]=testCase.monitor(RealtimeDependencyProbe()); %#ok<ASGLU>
+            monitor.startManual(); samples=testCase.samples(3,0,0,0);
+            samples(2).acceleration(1)=NaN;
+            imu.injectCallbackSamples(samples,10:12); monitor.poll();
+            summary=monitor.stop();
+            testCase.verifyEqual(summary.invalidSamples,1);
+            testCase.verifyEqual(summary.missingSamples,0);
+            testCase.verifyEqual(summary.lastSequence,uint64(12));
         end
         function dataQualityRecoversAfterGap(testCase)
             [monitor,imu,cleanup]=testCase.monitor(RealtimeDependencyProbe()); %#ok<ASGLU>
@@ -161,6 +231,21 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
         end
         function nearbyEventsMerge(testCase)
             events=testCase.brakingPair(8,false); testCase.verifyEqual(numel(events),1);
+        end
+        function verticalShockMergeSelectsFinitePeak(testCase)
+            options=struct('verticalShockReleaseSamples',1);
+            [monitor,imu,cleanup]=testCase.monitor(RealtimeDependencyProbe(),options); %#ok<ASGLU>
+            monitor.startManual();
+            first=testCase.samples(1,0,0,3);
+            calm=testCase.samples(1,0,0,0);
+            second=testCase.samples(2,0,0,3);
+            imu.injectCallbackSamples([first;calm;second;calm],1:5); monitor.poll(); monitor.stop();
+            events=monitor.getRecentEvents();
+            shock=events([events.type]=="VERTICAL_SHOCK_CANDIDATE");
+            testCase.verifyEqual(numel(shock),1);
+            testCase.verifyTrue(isfinite(shock.peakAcceleration));
+            testCase.verifyTrue(isfinite(shock.peakJerk));
+            testCase.verifyTrue(isfinite(shock.peakYawRate));
         end
         function distantEventsRemainSeparate(testCase)
             events=testCase.brakingPair(35,false); testCase.verifyEqual(numel(events),2);
