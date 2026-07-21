@@ -80,6 +80,7 @@ classdef TestRealtimeDrivingMonitor < matlab.unittest.TestCase
                 testCase.signalSamples(25,3,0,0);testCase.signalSamples(15,0,0,0); ...
                 testCase.signalSamples(25,-3,0,0);testCase.signalSamples(15,0,0,0)];
             imu.injectCallbackSamples(samples); monitor.poll();
+            monitor.stop();
             testCase.verifyEqual(monitor.EventsDetected,3);
             testCase.verifyEqual(numel(monitor.getRecentEvents()),2);
         end
@@ -100,13 +101,13 @@ classdef TestRealtimeDrivingMonitor < matlab.unittest.TestCase
         end
         function deleteStopsButDoesNotDisconnectImu(testCase)
             options=testCase.options(); imu=MockImuBrick2();
-            monitor=RealtimeDrivingMonitor(imu,createTestImuCalibration(true),options);
+            monitor=RealtimeDrivingMonitor(imu,createTestImuCalibration(true),options,testCase.dependencies());
             monitor.startManual(); delete(monitor);
             testCase.verifyFalse(imu.IsStreaming); testCase.verifyEqual(imu.DisconnectCount,0);
         end
         function syntheticCalibrationRejectedByDefault(testCase)
             options=testCase.options(); options.AllowSyntheticCalibration=false;
-            monitor=RealtimeDrivingMonitor(MockImuBrick2(),createTestImuCalibration(true),options);
+            monitor=RealtimeDrivingMonitor(MockImuBrick2(),createTestImuCalibration(true),options,testCase.dependencies());
             cleanup=onCleanup(@()delete(monitor));
             testCase.verifyError(@()monitor.startManual(),'IMU:InvalidCalibrationFile');
         end
@@ -146,13 +147,18 @@ classdef TestRealtimeDrivingMonitor < matlab.unittest.TestCase
         end
         function [monitor,imu,cleanup]=startedMonitor(testCase,options)
             if nargin<2, options=testCase.options(); end
-            imu=MockImuBrick2(); monitor=RealtimeDrivingMonitor(imu,createTestImuCalibration(true),options);
+            imu=MockImuBrick2(); imu.FreezeCallback=true;
+            monitor=RealtimeDrivingMonitor(imu,createTestImuCalibration(true), ...
+                options,testCase.dependencies());
             cleanup=onCleanup(@()delete(monitor)); monitor.startManual();
         end
         function options=options(~)
             options=getRealtimeDrivingConfig(); options.UseTimer=false;
             options.enableLivePlot=false; options.enableRecording=false;
             options.AllowSyntheticCalibration=true;
+        end
+        function value=dependencies(~)
+            value=struct('assertRuntimeReady',@()[]);
         end
         function samples=signalSamples(~,count,x,y,z)
             yawRate=20*sign(y);

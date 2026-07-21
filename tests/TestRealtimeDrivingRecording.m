@@ -38,15 +38,16 @@ classdef TestRealtimeDrivingRecording < matlab.unittest.TestCase
             options.UseTimer=false; options.enableLivePlot=false;
             options.enableRecording=true; options.recordingDirectory=directory;
             options.AllowSyntheticCalibration=true;
-            imu=MockImuBrick2(); monitor=RealtimeDrivingMonitor(imu, ...
-                createTestImuCalibration(true),options);
+            imu=MockImuBrick2(); imu.FreezeCallback=true;
+            monitor=RealtimeDrivingMonitor(imu, ...
+                createTestImuCalibration(true),options,struct('assertRuntimeReady',@()[]));
             cleanup=onCleanup(@()delete(monitor));
             monitor.startManual();
             samples=MockImuBrick2.createStationarySequence(12,eye(3));
             imu.injectCallbackSamples(samples); monitor.poll(); summary=monitor.stop();
             testCase.verifyEqual(summary.samplesProcessed,12);
             testCase.verifyEqual(summary.recording.samplesWritten,12);
-            testCase.verifyEqual(imu.DrainCallCount,1);
+            testCase.verifyGreaterThanOrEqual(imu.DrainCallCount,4);
             metadata=jsondecode(fileread(fullfile(summary.recording.directory,'metadata.json')));
             testCase.verifyEqual(metadata.sessionFormatVersion,2);
             testCase.verifyEqual(string(metadata.status),"complete");

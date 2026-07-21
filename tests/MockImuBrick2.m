@@ -19,6 +19,8 @@ classdef MockImuBrick2 < handle
         LastCallbackSequence = uint64(0)
         CallbackSessionId = uint64(0)
         DrainCallCount = 0
+        QuiesceCount = 0
+        ClearCount = 0
     end
     properties
         Samples
@@ -37,6 +39,9 @@ classdef MockImuBrick2 < handle
         InjectedDroppedSamples = 0
         InjectedCoalescedSamples = 0
         InjectedStaleSessionDrops = 0
+        FailStart = false
+        FailQuiesce = false
+        FailClear = false
     end
     properties (Access = private)
         Index = 1
@@ -82,6 +87,7 @@ classdef MockImuBrick2 < handle
         end
 
         function start(obj, periodMs)
+            if obj.FailStart, error('MockImu:StartFailure','Injected start failure.'); end
             obj.clearCallbackBuffer();
             obj.IsStreaming = true;
             obj.StreamingPeriodMs = double(periodMs);
@@ -90,8 +96,14 @@ classdef MockImuBrick2 < handle
             obj.CallbackGeneratedCount = 0;
         end
         function stop(obj)
-            obj.IsStreaming = false;
+            obj.quiesce();
             obj.clearCallbackBuffer();
+        end
+        function quiesce(obj)
+            obj.updateCallbacks();
+            obj.IsStreaming = false;
+            obj.QuiesceCount = obj.QuiesceCount + 1;
+            if obj.FailQuiesce, error('MockImu:QuiesceFailure','Injected quiesce failure.'); end
         end
         function data = latest(obj)
             if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
@@ -107,7 +119,6 @@ classdef MockImuBrick2 < handle
             data = obj.LatestData;
         end
         function data = nextCallbackSample(obj)
-            if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
             obj.updateCallbacks();
             data = [];
             if ~isempty(obj.CallbackQueue)
@@ -176,6 +187,8 @@ classdef MockImuBrick2 < handle
             obj.CallbackBufferedCount = uint64(numel(obj.CallbackQueue));
         end
         function clearCallbackBuffer(obj)
+            obj.ClearCount = obj.ClearCount + 1;
+            if obj.FailClear, error('MockImu:ClearFailure','Injected clear failure.'); end
             obj.CallbackQueue = cell(0, 1);
             obj.CallbackSessionId = obj.CallbackSessionId + uint64(1);
             obj.CallbackGeneratedCount = 0;

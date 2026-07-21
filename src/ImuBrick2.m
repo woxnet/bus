@@ -93,11 +93,16 @@ classdef ImuBrick2 < handle
         end
 
         function stop(obj)
+            obj.quiesce();
+            obj.clearCallbackBuffer();
+        end
+
+        function quiesce(obj)
+            %QUIESCE Stop callback generation while preserving queued data.
             if obj.IsConnected
                 obj.Device.setAllDataPeriod(int64(0));
-                obj.IsStreaming = false;
-                obj.clearCallbackBuffer();
             end
+            obj.IsStreaming = false;
         end
 
         function data = readOnce(obj)

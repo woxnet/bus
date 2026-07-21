@@ -22,9 +22,12 @@ classdef TestRealtimeOnlineOfflineComparison < matlab.unittest.TestCase
                 offline=analyzeImuSession(directory,struct('AllowSynthetic',true,'SaveAnalysis',false));
                 testCase.assertTrue(offline.success,strjoin(offline.errors,' '));
                 realtime=testCase.runRealtime(directory);
-                comparison=compareRealtimeAndOfflineEvents(realtime,offline.events,25);
+                comparison=compareRealtimeAndOfflineEvents(realtime,offline.events, ...
+                    'StartEndToleranceSamples',25, ...
+                    'PeakAccelerationTolerance',1.0, ...
+                    'DurationToleranceSeconds',1.0);
                 testCase.verifyTrue(comparison.countMatch,char(scenario));
-                testCase.verifyTrue(comparison.allWithinLatency,char(scenario));
+                testCase.verifyTrue(comparison.allWithinTolerance,char(scenario));
             end
         end
         function comparisonReportsMismatches(testCase)
@@ -34,14 +37,44 @@ classdef TestRealtimeOnlineOfflineComparison < matlab.unittest.TestCase
             report=compareRealtimeAndOfflineEvents(base,other,5);
             testCase.verifyTrue(report.countMatch); testCase.verifyFalse(report.allWithinLatency);
         end
+        function matchingUsesTypeAndNearestStart(testCase)
+            offline=[testCase.event("BRAKING_CANDIDATE",100,120,-2); ...
+                testCase.event("ACCELERATION_CANDIDATE",50,70,2); ...
+                testCase.event("BRAKING_CANDIDATE",10,30,-2)];
+            realtime=[testCase.event("BRAKING_CANDIDATE",12,32,-2.1); ...
+                testCase.event("ACCELERATION_CANDIDATE",52,72,2.1); ...
+                testCase.event("BRAKING_CANDIDATE",98,118,-1.9)];
+            report=compareRealtimeAndOfflineEvents(realtime,offline, ...
+                'StartEndToleranceSamples',3,'PeakAccelerationTolerance',0.2, ...
+                'DurationToleranceSeconds',0.01);
+            testCase.verifyTrue(report.allWithinTolerance);
+            testCase.verifyEqual([report.details.offlineIndex],[3 2 1]);
+        end
+        function peakAndDurationArePartOfTolerance(testCase)
+            offline=testCase.event("BRAKING_CANDIDATE",10,20,-2);
+            realtime=offline; realtime.peakAcceleration=-4; realtime.durationSeconds=2;
+            report=compareRealtimeAndOfflineEvents(realtime,offline, ...
+                'PeakAccelerationTolerance',0.5,'DurationToleranceSeconds',0.1);
+            testCase.verifyFalse(report.allWithinTolerance);
+            testCase.verifyTrue(report.allWithinLatency);
+            testCase.verifyTrue(report.details.withinLatency);
+            testCase.verifyFalse(report.details.withinPeakTolerance);
+            testCase.verifyFalse(report.details.withinDurationTolerance);
+        end
     end
     methods(Access=private)
+        function value=event(~,type,startSequence,endSequence,peak)
+            value=struct('type',string(type),'startSequence',uint64(startSequence), ...
+                'endSequence',uint64(endSequence),'peakAcceleration',peak, ...
+                'durationSeconds',double(endSequence-startSequence+1)/50);
+        end
         function events=runRealtime(~,directory)
             options=getRealtimeDrivingConfig(); options.UseTimer=false;
             options.enableLivePlot=false; options.enableRecording=false;
             options.AllowSyntheticCalibration=true; options.stopOnOverflow=false;
             imu=MockImuBrick2(); imu.FreezeCallback=true;
-            monitor=RealtimeDrivingMonitor(imu,createTestImuCalibration(true),options);
+            monitor=RealtimeDrivingMonitor(imu,createTestImuCalibration(true),options, ...
+                struct('assertRuntimeReady',@()[]));
             cleanup=onCleanup(@()delete(monitor));
             monitor.startManual(); files=dir(fullfile(directory,'samples_*.mat'));
             for index=1:numel(files)

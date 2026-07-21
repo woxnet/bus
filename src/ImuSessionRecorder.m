@@ -79,6 +79,10 @@ classdef ImuSessionRecorder < handle
             if ~obj.IsRecording || ~obj.ExternalMode
                 error('IMU:RecorderNotExternal', 'External recorder is not active.');
             end
+            if isprop(obj.Imu, 'IsStreaming') && obj.Imu.IsStreaming
+                error('IMU:RecorderFinalizedWhileStreaming', ...
+                    'Quiesce the IMU before finalizing an external recording.');
+            end
             obj.flushChunk();
             session = obj.finalize(stats);
         end
