@@ -37,12 +37,12 @@ classdef TestImuCallbackBuild < matlab.unittest.TestCase
         function runtimeUsesShippedBridgeWithoutCompilation(testCase)
             bridgePath = getImuCallbackBridgePath();
             expected = fullfile(testCase.ProjectRoot, 'lib-generated', ...
-                'imu-callback-bridge.jar');
+                'imu-callback-bridge-v2.jar');
             testCase.verifyEqual(bridgePath, expected);
             testCase.verifyTrue(isfile(bridgePath));
         end
 
-        function jarTimestampInvalidatesBuild(testCase)
+        function jarContentInvalidatesBuild(testCase)
             options = testCase.options();
             [~, first] = buildImuCallbackBridge(options);
             testCase.verifyTrue(first.rebuilt);
@@ -57,20 +57,39 @@ classdef TestImuCallbackBuild < matlab.unittest.TestCase
             [~, changed] = buildImuCallbackBridge(options);
             testCase.verifyTrue(changed.rebuilt);
         end
+
+        function sourceContentInvalidatesBuild(testCase)
+            options = testCase.options();
+            [~, first] = buildImuCallbackBridge(options);
+            if first.rebuilt
+                [~, cached] = buildImuCallbackBridge(options);
+                testCase.verifyFalse(cached.rebuilt);
+            end
+            fileId = fopen(options.sourceFile, 'a');
+            assert(fileId >= 0); fprintf(fileId, '\n'); fclose(fileId);
+            [~, changed] = buildImuCallbackBridge(options);
+            testCase.verifyTrue(changed.rebuilt);
+        end
     end
 
     methods (Access = private)
         function options = options(testCase)
-            source = fullfile(testCase.ProjectRoot, 'java', 'bus', 'imu', ...
+            projectSource = fullfile(testCase.ProjectRoot, 'java', 'bus', 'imu', ...
                 'ImuAllDataBuffer.java');
+            source = fullfile(testCase.TemporaryDirectory, 'ImuAllDataBuffer.java');
+            if ~isfile(source), copyfile(projectSource, source); end
             jar = fullfile(testCase.TemporaryDirectory, 'Tinkerforge.jar');
             if ~isfile(jar)
                 stub = fullfile(testCase.ProjectRoot, 'java', 'test', ...
                     'com', 'tinkerforge', 'BrickIMUV2.java');
                 stubClasses = fullfile(testCase.TemporaryDirectory, 'stub-classes');
                 mkdir(stubClasses);
+                [versionStatus, versionOutput] = system('javac -version 2>&1');
+                assert(versionStatus == 0, versionOutput);
+                flags = selectJava8CompilerFlags( ...
+                    parseJavacMajorVersion(versionOutput));
                 [compileStatus, compileOutput] = system(sprintf( ...
-                    'javac --release 8 -d "%s" "%s"', stubClasses, stub));
+                    'javac %s -d "%s" "%s"', flags, stubClasses, stub));
                 assert(compileStatus == 0, compileOutput);
                 [jarStatus, jarOutput] = system(sprintf( ...
                     'jar cf "%s" -C "%s" .', jar, stubClasses));

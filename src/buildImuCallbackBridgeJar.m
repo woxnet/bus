@@ -7,7 +7,7 @@ root = fileparts(fileparts(mfilename('fullpath')));
 [classesDirectory, buildInfo] = buildImuCallbackBridge();
 outputDirectory = fullfile(root, 'lib-generated');
 if ~isfolder(outputDirectory), mkdir(outputDirectory); end
-jarFile = fullfile(outputDirectory, 'imu-callback-bridge.jar');
+jarFile = fullfile(outputDirectory, 'imu-callback-bridge-v2.jar');
 
 [toolStatus, toolOutput] = system('jar --version');
 if toolStatus ~= 0

@@ -10,20 +10,24 @@ public final class ImuAllDataBuffer implements BrickIMUV2.AllDataListener {
 
     public static final class Snapshot {
         private final BrickIMUV2.AllDataCallbackData data;
+        private final long sessionId;
         private final long sequence;
         private final long timestampEpochMillis;
         private final long timestampNanos;
 
-        Snapshot(BrickIMUV2.AllDataCallbackData data, long sequence,
+        Snapshot(BrickIMUV2.AllDataCallbackData data, long sessionId, long sequence,
                  long timestampEpochMillis, long timestampNanos) {
             this.data = data;
+            this.sessionId = sessionId;
             this.sequence = sequence;
             this.timestampEpochMillis = timestampEpochMillis;
             this.timestampNanos = timestampNanos;
         }
 
         public BrickIMUV2.AllDataCallbackData getData() { return data; }
+        public long getSessionId() { return sessionId; }
         public long getSequence() { return sequence; }
+        public long getTimestampMillis() { return timestampEpochMillis; }
         public long getTimestampEpochMillis() { return timestampEpochMillis; }
         public long getTimestampNanos() { return timestampNanos; }
         public long getAgeNanos() {
@@ -33,8 +37,11 @@ public final class ImuAllDataBuffer implements BrickIMUV2.AllDataListener {
 
     private final int capacity;
     private final Deque<Snapshot> queue;
+    private long sessionId;
     private long receivedCount;
-    private long droppedCount;
+    private long overflowDroppedCount;
+    private long coalescedCount;
+    private long staleSessionDropCount;
     private long lastSequence;
 
     public ImuAllDataBuffer() { this(DEFAULT_CAPACITY); }
@@ -49,13 +56,27 @@ public final class ImuAllDataBuffer implements BrickIMUV2.AllDataListener {
 
     @Override
     public synchronized void allData(BrickIMUV2.AllDataCallbackData data) {
+        addSnapshot(data, sessionId);
+    }
+
+    void allDataForSession(BrickIMUV2.AllDataCallbackData data, long callbackSessionId) {
+        synchronized (this) {
+            addSnapshot(data, callbackSessionId);
+        }
+    }
+
+    private void addSnapshot(BrickIMUV2.AllDataCallbackData data, long callbackSessionId) {
+        if (callbackSessionId != sessionId) {
+            staleSessionDropCount++;
+            return;
+        }
         receivedCount++;
         lastSequence++;
         if (queue.size() == capacity) {
             queue.removeFirst();
-            droppedCount++;
+            overflowDroppedCount++;
         }
-        queue.addLast(new Snapshot(data, lastSequence,
+        queue.addLast(new Snapshot(data, sessionId, lastSequence,
                 System.currentTimeMillis(), System.nanoTime()));
     }
 
@@ -66,7 +87,7 @@ public final class ImuAllDataBuffer implements BrickIMUV2.AllDataListener {
     public synchronized Snapshot pollLatest() {
         Snapshot latest = queue.pollLast();
         if (latest != null) {
-            droppedCount += queue.size();
+            coalescedCount += queue.size();
             queue.clear();
         }
         return latest;
@@ -77,9 +98,25 @@ public final class ImuAllDataBuffer implements BrickIMUV2.AllDataListener {
         queue.clear();
     }
 
+    /** Atomically start an isolated stream session. */
+    public synchronized long beginSession() {
+        sessionId++;
+        queue.clear();
+        receivedCount = 0;
+        overflowDroppedCount = 0;
+        coalescedCount = 0;
+        staleSessionDropCount = 0;
+        lastSequence = 0;
+        return sessionId;
+    }
+
     public synchronized int size() { return queue.size(); }
     public int getCapacity() { return capacity; }
+    public int getMaxSize() { return capacity; }
+    public synchronized long getSessionId() { return sessionId; }
     public synchronized long getReceivedCount() { return receivedCount; }
-    public synchronized long getDroppedCount() { return droppedCount; }
+    public synchronized long getOverflowDroppedCount() { return overflowDroppedCount; }
+    public synchronized long getCoalescedCount() { return coalescedCount; }
+    public synchronized long getStaleSessionDropCount() { return staleSessionDropCount; }
     public synchronized long getLastSequence() { return lastSequence; }
 }

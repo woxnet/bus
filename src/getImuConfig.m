@@ -13,6 +13,7 @@ config.sampleRateHz = 50;
 config.samplePeriodSeconds = 0.02;
 config.callbackPeriodMs = 20;
 config.callbackBufferCapacity = 256;
+config.callbackBufferMaximumSize = config.callbackBufferCapacity;
 config.maximumPreflightDroppedCallbacks = 0;
 config.maximumCallbackSampleAgeMs = 2 * config.callbackPeriodMs;
 config.sensorFusionMode = 2;

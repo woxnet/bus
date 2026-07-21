@@ -23,6 +23,8 @@ classdef ImuMountCalibrator < handle
         Imu
         CancelRequested = false
         ConsecutiveReadErrors = 0
+        PacingTimer
+        NextSampleDeadline = 0
     end
 
     methods
@@ -53,26 +55,36 @@ classdef ImuMountCalibrator < handle
                 end
                 metadata = obj.defaultSyntheticMetadata();
             end
+            if ~isfield(metadata, 'synthetic') || ...
+                    ~(islogical(metadata.synthetic) && isscalar(metadata.synthetic))
+                error('IMU:CalibrationMetadataRequired', ...
+                    'metadata.synthetic must be an explicit logical scalar.');
+            end
             obj.CancelRequested = false;
             obj.ConsecutiveReadErrors = 0;
+            obj.PacingTimer = tic;
+            obj.NextSampleDeadline = 0;
             obj.setStatus("INITIALIZATION", 0, "Проверка доступности IMU");
             try
                 obj.readSample();
                 [stationary, gravity, linearBias, gyroBias] = obj.findStationary();
                 zSensor = -obj.normalizeVector(gravity);
-                forward = obj.findForward(zSensor, linearBias, gyroBias);
+                [forward, forwardTimes] = obj.findForward( ...
+                    zSensor, linearBias, gyroBias);
 
                 obj.setStatus("VALIDATION", 0.92, ...
                     "Проверка качества калибровки");
                 [R, axes] = obj.buildRotation(zSensor, mean(forward, 1));
-                quality = obj.calculateQuality(stationary, forward, R);
+                quality = obj.calculateQuality( ...
+                    stationary, forward, forwardTimes, R);
                 calibration = obj.makeCalibration(R, axes, linearBias, gyroBias, quality, metadata);
                 if ~quality.valid
                     obj.LastMessage = "Калибровка отклонена из-за низкого качества";
                     error('IMU:CalibrationRejected', ...
                         'Calibration quality %.3f does not meet requirements.', quality.score);
                 end
-                report = validateImuCalibration(calibration);
+                report = validateImuCalibration(calibration, ...
+                    'AllowSynthetic', logical(metadata.synthetic));
                 if ~report.valid
                     error('IMU:CalibrationRejected', '%s', strjoin(report.errors, ' '));
                 end
@@ -136,7 +148,9 @@ classdef ImuMountCalibrator < handle
                 end
                 data = obj.readSample();
                 if obj.isStationary(data)
-                    samples(end+1, 1) = obj.measurement(data); %#ok<AGROW>
+                    measurement = obj.measurement(data);
+                    measurement.monotonicSeconds = toc(obj.PacingTimer);
+                    samples(end+1, 1) = measurement; %#ok<AGROW>
                     obj.Progress = min(0.40, 0.05 + 0.35 * numel(samples) / needed);
                 else
                     samples = repmat(obj.emptyMeasurement(), 0, 1);
@@ -154,11 +168,12 @@ classdef ImuMountCalibrator < handle
             gyroBias = mean(gyroValues, 1).';
         end
 
-        function samples = findForward(obj, zSensor, linearBias, gyroBias)
+        function [samples, sampleTimes] = findForward(obj, zSensor, linearBias, gyroBias)
             obj.setStatus("WAIT_FORWARD_ACCELERATION", 0.50, ...
                 "Начните плавный разгон строго вперёд");
             needed = max(1, ceil(obj.Config.forwardAccelerationDuration * obj.Config.sampleRate));
             samples = zeros(0, 3);
+            sampleTimes = zeros(0, 1);
             gapSamples = 0;
             maxGap = floor(obj.Config.maximumForwardSampleGap * obj.Config.sampleRate);
             timer = tic;
@@ -185,18 +200,21 @@ classdef ImuMountCalibrator < handle
 
                 if turning
                     samples = zeros(0, 3);
+                    sampleTimes = zeros(0, 1);
                     gapSamples = 0;
                     obj.Progress = 0.50;
                     obj.LastMessage = "Обнаружен поворот, сегмент разгона сброшен";
                     fprintf('%s\n', char(obj.LastMessage));
                 elseif validMagnitude && consistent
                     samples(end+1, :) = horizontal.'; %#ok<AGROW>
+                    sampleTimes(end+1, 1) = toc(obj.PacingTimer); %#ok<AGROW>
                     gapSamples = 0;
                     obj.Progress = min(0.88, 0.50 + 0.38 * size(samples, 1) / needed);
                 elseif ~isempty(samples) && gapSamples < maxGap
                     gapSamples = gapSamples + 1;
                 else
                     samples = zeros(0, 3);
+                    sampleTimes = zeros(0, 1);
                     gapSamples = 0;
                     obj.Progress = 0.50;
                 end
@@ -265,7 +283,7 @@ classdef ImuMountCalibrator < handle
             axes = struct('forward', xSensor(:), 'left', ySensor(:), 'up', zSensor(:));
         end
 
-        function quality = calculateQuality(obj, stationary, forward, R)
+        function quality = calculateQuality(obj, stationary, forward, forwardTimes, R)
             gravityValues = vertcat(stationary.gravity);
             gyroValues = vertcat(stationary.angularVelocity);
             meanGravity = mean(gravityValues, 1);
@@ -282,6 +300,9 @@ classdef ImuMountCalibrator < handle
             coherence = norm(mean(directions, 1));
             orthogonalityError = norm(R * R' - eye(3), 'fro');
             determinant = det(R);
+            stationaryTimes = [stationary.monotonicSeconds].';
+            stationaryRate = obj.measuredRate(stationaryTimes);
+            forwardRate = obj.measuredRate(forwardTimes);
 
             gravityScore = obj.clamp01(1 - abs(gravityMagnitude - 9.81) / ...
                 obj.Config.maxGravityMagnitudeError);
@@ -313,6 +334,8 @@ classdef ImuMountCalibrator < handle
                 'determinant', determinant, ...
                 'stationarySampleCount', size(gravityValues, 1), ...
                 'forwardSampleCount', size(forward, 1));
+            quality.actualStationarySampleRateHz = stationaryRate;
+            quality.actualForwardSampleRateHz = forwardRate;
         end
 
         function calibration = makeCalibration(obj, R, axes, linearBias, gyroBias, quality, metadata)
@@ -398,7 +421,27 @@ classdef ImuMountCalibrator < handle
         end
 
         function samplePause(obj)
-            pause(1 / obj.Config.sampleRate);
+            period = 1 / obj.Config.sampleRate;
+            elapsed = toc(obj.PacingTimer);
+            if obj.NextSampleDeadline <= 0
+                obj.NextSampleDeadline = elapsed + period;
+            else
+                obj.NextSampleDeadline = obj.NextSampleDeadline + period;
+                if obj.NextSampleDeadline < elapsed
+                    missed = floor((elapsed - obj.NextSampleDeadline) / period) + 1;
+                    obj.NextSampleDeadline = obj.NextSampleDeadline + missed * period;
+                end
+            end
+            pause(max(0, obj.NextSampleDeadline - elapsed));
+        end
+
+        function rate = measuredRate(~, timestamps)
+            if numel(timestamps) < 2 || timestamps(end) <= timestamps(1)
+                rate = NaN;
+            else
+                rate = (numel(timestamps) - 1) / ...
+                    (timestamps(end) - timestamps(1));
+            end
         end
 
         function setStatus(obj, state, progress, message)
@@ -433,13 +476,14 @@ classdef ImuMountCalibrator < handle
 
         function measurement = emptyMeasurement()
             measurement = struct('gravity', [], 'linearAcceleration', [], ...
-                'angularVelocity', []);
+                'angularVelocity', [], 'monotonicSeconds', NaN);
         end
 
         function measurement = measurement(data)
             measurement = struct('gravity', data.gravity(:).', ...
                 'linearAcceleration', data.linearAcceleration(:).', ...
-                'angularVelocity', data.angularVelocity(:).');
+                'angularVelocity', data.angularVelocity(:).', ...
+                'monotonicSeconds', NaN);
         end
     end
 end

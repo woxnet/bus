@@ -1,4 +1,4 @@
-function vehicleData = applyMountCalibration(sensorData, calibration)
+function vehicleData = applyMountCalibration(sensorData, calibration, varargin)
 %APPLYMOUNTCALIBRATION Transform IMU vectors into vehicle coordinates.
 %   VEHICLEDATA = APPLYMOUNTCALIBRATION(SENSORDATA, CALIBRATION) returns a
 %   copy of SENSORDATA and transforms available 3-D vector fields. Bias is
@@ -6,7 +6,12 @@ function vehicleData = applyMountCalibration(sensorData, calibration)
 %   sensorEuler and sensorQuaternion, when present, remain explicitly in the
 %   sensor coordinate system; no ambiguous euler/quaternion fields are kept.
 
-report = validateImuCalibration(calibration);
+parser = inputParser;
+parser.addParameter('AllowSynthetic', false, ...
+    @(value)islogical(value) && isscalar(value));
+parser.parse(varargin{:});
+report = validateImuCalibration(calibration, ...
+    'AllowSynthetic', parser.Results.AllowSynthetic);
 if ~report.valid
     error('IMU:InvalidCalibrationFile', '%s', strjoin(report.errors, ' '));
 end

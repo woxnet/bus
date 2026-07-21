@@ -64,13 +64,32 @@ backlog and returns the newest unread sample; it raises
 Callback sequence and received/dropped counters remain monotonic when the
 queue is cleared or the stream is restarted.
 
-Normal runtime loads `lib-generated/imu-callback-bridge.jar`. Developers only
+Normal runtime loads `lib-generated/imu-callback-bridge-v2.jar`. Developers only
 need JDK 8 or newer when rebuilding it reproducibly:
 
 ```matlab
-startup;
+addpath("src");
 buildImuCallbackBridgeJar();
 ```
+
+Each `start()` creates an isolated stream session. Statistics distinguish
+buffer overflow, intentional `latest()` coalescing, and stale-session callback
+drops. Diagnostic frequency and age calculations use Java monotonic time, and
+the callback phase validates decoded sensor payloads rather than metadata only.
+
+## Hardware acceptance
+
+With the physical IMU connected, run the controlled 60-second FIFO test:
+
+```matlab
+run("examples/run_imu_hardware_acceptance.m");
+```
+
+Reports are written to ignored `artifacts/` MAT and JSON files. Long raw
+sessions can be recorded with `ImuSessionRecorder`; it writes bounded MAT
+chunks under ignored `sessions/` and marks interrupted sessions as incomplete.
+Synthetic calibration files are rejected by validation, loading, application,
+and recording unless an explicit test-only permission is supplied.
 
 ## Installation calibration
 

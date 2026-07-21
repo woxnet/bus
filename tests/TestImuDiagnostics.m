@@ -80,6 +80,12 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             testCase.verifyTrue(report.callbackSequenceAdvances);
             testCase.verifyEqual(report.callbackMissingSequences, 0);
             testCase.verifyEqual(report.callbackDroppedSamples, 0);
+            testCase.verifyEqual(report.callbackOverflowDropped, 0);
+            testCase.verifyEqual(report.callbackCoalesced, 0);
+            testCase.verifyEqual(report.callbackStaleSessionDropped, 0);
+            testCase.verifyEqual(report.callbackPayloadsDecoded, 100);
+            testCase.verifyTrue(report.callbackPayloadFieldsValid);
+            testCase.verifyTrue(report.callbackPayloadValuesFinite);
             testCase.verifyGreaterThanOrEqual(report.callbackReceivedTotal, 100);
             testCase.verifyEqual(report.callbackBufferCapacity, 256);
             testCase.verifyGreaterThan(report.callbackMaximumBuffered, 0);
@@ -94,6 +100,13 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             testCase.verifyGreaterThan(report.callbackMissingSequences, 0);
         end
 
+        function callbackCapacityMismatchRejected(testCase)
+            imu = testCase.hardwareMock(); imu.ReportedCallbackCapacity = 128;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyEqual(report.callbackBufferCapacity, 128);
+        end
+
         function staleCallbackRejected(testCase)
             imu = testCase.hardwareMock(); imu.CallbackTimestampOffsetSeconds = 0.1;
             report = diagnoseImuBrick2(imu, testCase.dependencies());
@@ -106,6 +119,20 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
             report = diagnoseImuBrick2(imu, testCase.dependencies());
             testCase.verifyFalse(report.success);
             testCase.verifyEqual(report.callbackDroppedSamples, 1);
+        end
+
+        function staleSessionDropRejected(testCase)
+            imu = testCase.hardwareMock(); imu.InjectedStaleSessionDrops = 1;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyFalse(report.success);
+            testCase.verifyEqual(report.callbackStaleSessionDropped, 1);
+        end
+
+        function intentionalCoalescingDoesNotFailPreflight(testCase)
+            imu = testCase.hardwareMock(); imu.InjectedCoalescedSamples = 2;
+            report = diagnoseImuBrick2(imu, testCase.dependencies());
+            testCase.verifyTrue(report.success);
+            testCase.verifyEqual(report.callbackCoalesced, 2);
         end
 
         function latestAndSequentialDrainSemantics(testCase)
@@ -125,9 +152,11 @@ classdef TestImuDiagnostics < matlab.unittest.TestCase
         function stopStartClearsOldCallbacks(testCase)
             imu = testCase.hardwareMock(); imu.start(1); pause(0.005);
             old = imu.nextCallbackSample();
+            oldSession = old.sessionId;
             imu.stop(); imu.start(1); pause(0.002);
             fresh = imu.nextCallbackSample();
-            testCase.verifyGreaterThan(fresh.sequenceNumber, old.sequenceNumber);
+            testCase.verifyEqual(fresh.sequenceNumber, uint64(1));
+            testCase.verifyGreaterThan(fresh.sessionId, oldSession);
             testCase.verifyEqual(fresh.callbackDroppedTotal, uint64(0));
         end
 

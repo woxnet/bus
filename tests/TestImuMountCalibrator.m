@@ -14,7 +14,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             testCase.verifyLessThan(norm(calibration.rotationVehicleFromSensor - eye(3), 'fro'), 0.03);
             transformed = applyMountCalibration(struct( ...
                 'gravity', [0 0 -9.81], 'linearAcceleration', [1 0 0], ...
-                'angularVelocity', [0 0 0]), calibration);
+                'angularVelocity', [0 0 0]), calibration, ...
+                'AllowSynthetic', true);
             testCase.verifyEqual(transformed.gravity, [0;0;-9.81], 'AbsTol', 1e-10);
             testCase.verifyGreaterThan(transformed.longitudinalAcceleration, 0.9);
         end
@@ -140,6 +141,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             testCase.verifyEqual(calibration.version, 2);
             testCase.verifyTrue(isfield(calibration, 'metadata'));
             testCase.verifyEqual(calibration.metadata.algorithmVersion, "2.0");
+            testCase.verifyGreaterThan(calibration.quality.actualStationarySampleRateHz, 0);
+            testCase.verifyGreaterThan(calibration.quality.actualForwardSampleRateHz, 0);
         end
 
         function saveRequiresHardwareMetadata(testCase)
@@ -184,9 +187,11 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             calibration.metadata.imuUid = "imu_a";
             file = fullfile(directory, 'bound.mat');
             save(file, 'calibration');
-            testCase.verifyError(@()loadImuCalibration(file, "bus_b", "imu_a"), ...
+            testCase.verifyError(@()loadImuCalibration(file, "bus_b", "imu_a", ...
+                'AllowSynthetic', true), ...
                 'IMU:CalibrationBusMismatch');
-            testCase.verifyError(@()loadImuCalibration(file, "bus_a", "imu_b"), ...
+            testCase.verifyError(@()loadImuCalibration(file, "bus_a", "imu_b", ...
+                'AllowSynthetic', true), ...
                 'IMU:CalibrationDeviceMismatch');
             clear cleanup;
         end
@@ -226,7 +231,8 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
             data = struct('linearAcceleration',[0 0 0], ...
                 'angularVelocity',[0 0 0], 'euler',[1 2 3], ...
                 'quaternion',[1 0 0 0]);
-            transformed = applyMountCalibration(data, calibration);
+            transformed = applyMountCalibration(data, calibration, ...
+                'AllowSynthetic', true);
             testCase.verifyFalse(isfield(transformed, 'euler'));
             testCase.verifyFalse(isfield(transformed, 'quaternion'));
             testCase.verifyEqual(transformed.sensorEuler, [1 2 3]);
@@ -263,7 +269,7 @@ classdef TestImuMountCalibrator < matlab.unittest.TestCase
                 'deviceIdentifier', 18, 'firmwareVersion', [2 0 15], ...
                 'sensorFusionMode', project.sensorFusionMode, ...
                 'sampleRateHz', project.sampleRateHz, ...
-                'algorithmVersion', "2.0");
+                'algorithmVersion', "2.0", 'synthetic', false);
         end
 
         function config = fastConfig(~)
