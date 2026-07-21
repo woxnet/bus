@@ -136,14 +136,40 @@ gapped sessions by default. Missing-sample sessions may be inspected only with
 an explicit option; processing then creates independent continuous segments so
 filtering, derivatives, and event merging never cross a sequence gap.
 
+New recordings use session format version 2. Both metadata and summary store
+the actual `sampleRateHz` and `callbackPeriodMs`; these values must agree, and
+the analysis refuses a rate outside `sampleRateToleranceHz` instead of silently
+resampling. Version 1 recordings have no rate provenance and are rejected by
+default. A known legacy rate must be supplied explicitly:
+
 ```matlab
-startup;
-result = analyzeImuSession("sessions/<session-id>");
-assert(result.success, strjoin(result.errors, " "));
-plotDrivingSessionAnalysis(result);
+options = struct("AllowLegacySession", true, "LegacySampleRateHz", 50);
+result = analyzeImuSession("sessions/<legacy-session-id>", options);
 ```
 
-The analysis writes `analysis/result.mat`, `analysis/events.json`, and
+Legacy identity comes from metadata and is reported as not verified per
+sample. Format version 2 requires matching UID and bus ID in every sample.
+The loader preallocates numeric arrays, does not retain raw cell structures by
+default, and supports `MaximumSamplesInMemory` as an explicit safety limit.
+The separate 500,000-sample integration test is available with:
+
+```matlab
+startup;
+addpath("tests");
+memoryReport = runImuSessionLoaderMemoryTest();
+assert(memoryReport.success);
+```
+
+```matlab
+startup;
+result = analyzeImuSession("sessions/<session-id>", struct("SavePlots", true));
+assert(result.success, strjoin(result.errors, " "));
+```
+
+The analysis first writes and verifies `analysis.inprogress/`, then replaces
+the final directory transactionally. A failed write returns `success=false`,
+removes the staging directory, and never exposes a partial successful result.
+The final output contains `analysis/result.mat`, `analysis/events.json`, and
 `analysis/summary.json` inside the session directory. Diagnostic plots are
 written as `analysis/diagnostic_plots.png` and `.fig`. Source recordings are
 never modified. To exercise the pipeline without hardware, tests must opt in

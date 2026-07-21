@@ -8,6 +8,13 @@ if ~isstruct(session) || ~isscalar(session) || ~isfield(session, 'data') || ...
         ~istable(session.data)
     error('IMU:InvalidDrivingSession', 'session.data must be a MATLAB table.');
 end
+if ~isfield(session, 'sampleRateHz') || ...
+        ~(isnumeric(session.sampleRateHz) && isscalar(session.sampleRateHz) && ...
+        isfinite(session.sampleRateHz) && session.sampleRateHz > 0)
+    error('IMU:InvalidDrivingSession', ...
+        'session.sampleRateHz must contain the confirmed source frequency.');
+end
+sampleRateHz = double(session.sampleRateHz);
 data = session.data;
 required = {'sequenceNumber','hostTimestamp','sessionId','timeSeconds', ...
     'longitudinalAcceleration','lateralAcceleration','verticalAcceleration', ...
@@ -24,7 +31,7 @@ yawRateRaw = double(data.yawRate(:));
 callbackAgeMs = double(data.callbackAgeMs(:));
 dataValid = isfinite(longitudinalRaw) & isfinite(lateralRaw) & ...
     isfinite(verticalRaw) & isfinite(yawRateRaw) & isfinite(callbackAgeMs);
-segmentId = assignSegments(sequence, dataValid);
+segmentId = assignSegments(sequence, data.hostTimestamp(:), dataValid, config);
 
 longitudinalDespiked = longitudinalRaw;
 lateralDespiked = lateralRaw;
@@ -55,19 +62,19 @@ verticalJerk = nan(height(data), 1);
 for segment = segments
     indices = find(segmentId == segment);
     longitudinalFiltered(indices) = zeroPhaseEma( ...
-        longitudinalDespiked(indices), config.targetSampleRateHz, config.lowPassCutoffHz);
+        longitudinalDespiked(indices), sampleRateHz, config.lowPassCutoffHz);
     lateralFiltered(indices) = zeroPhaseEma( ...
-        lateralDespiked(indices), config.targetSampleRateHz, config.lowPassCutoffHz);
+        lateralDespiked(indices), sampleRateHz, config.lowPassCutoffHz);
     verticalFiltered(indices) = zeroPhaseEma( ...
-        verticalDespiked(indices), config.targetSampleRateHz, config.lowPassCutoffHz);
+        verticalDespiked(indices), sampleRateHz, config.lowPassCutoffHz);
     yawRateFiltered(indices) = zeroPhaseEma( ...
-        yawDespiked(indices), config.targetSampleRateHz, config.lowPassCutoffHz);
+        yawDespiked(indices), sampleRateHz, config.lowPassCutoffHz);
     longitudinalJerk(indices) = centralDifference( ...
-        longitudinalFiltered(indices), config.targetSampleRateHz);
+        longitudinalFiltered(indices), sampleRateHz);
     lateralJerk(indices) = centralDifference( ...
-        lateralFiltered(indices), config.targetSampleRateHz);
+        lateralFiltered(indices), sampleRateHz);
     verticalJerk(indices) = centralDifference( ...
-        verticalFiltered(indices), config.targetSampleRateHz);
+        verticalFiltered(indices), sampleRateHz);
 end
 
 processed = struct('sequenceNumber', sequence, ...
@@ -82,16 +89,22 @@ processed = struct('sequenceNumber', sequence, ...
     'verticalFiltered', verticalFiltered, 'verticalJerk', verticalJerk, ...
     'yawRateRaw', yawRateRaw, 'yawRateFiltered', yawRateFiltered, ...
     'segmentId', segmentId, 'dataValid', dataValid, ...
-    'outlierReplaced', outlierReplaced, 'config', config);
+    'outlierReplaced', outlierReplaced, 'sampleRateHz', sampleRateHz, ...
+    'config', config);
 end
 
-function segmentId = assignSegments(sequence, valid)
+function segmentId = assignSegments(sequence, hostTimestamp, valid, config)
 segmentId = zeros(numel(sequence), 1);
 current = 0;
 for index = 1:numel(sequence)
     if ~valid(index), continue; end
+    timestampGap = false;
+    if index > 1 && valid(index - 1)
+        timestampGap = seconds(hostTimestamp(index) - ...
+            hostTimestamp(index - 1)) > config.segmentGapSeconds;
+    end
     startsSegment = index == 1 || ~valid(index - 1) || ...
-        sequence(index) ~= sequence(index - 1) + 1;
+        sequence(index) ~= sequence(index - 1) + 1 || timestampGap;
     if startsSegment, current = current + 1; end
     segmentId(index) = current;
 end

@@ -37,6 +37,19 @@ classdef TestDrivingPreprocessing < matlab.unittest.TestCase
             testCase.verifyTrue(isnan(processed.longitudinalJerk(boundary)));
         end
 
+        function timestampGapStartsNewSegment(testCase)
+            count = 500;
+            session = testCase.sessionFromSignals(zeros(count, 1), ...
+                zeros(count, 3), uint64(1:count));
+            session.data.hostTimestamp(251:end) = ...
+                session.data.hostTimestamp(251:end) + seconds(1);
+            processed = preprocessDrivingSession(session);
+            testCase.verifyNotEqual(processed.segmentId(250), ...
+                processed.segmentId(251));
+            testCase.verifyTrue(isnan(processed.longitudinalJerk(250)));
+            testCase.verifyTrue(isnan(processed.longitudinalJerk(251)));
+        end
+
         function invalidConfigRejected(testCase)
             config = getDrivingAnalysisConfig();
             config.accelerationStopThreshold = config.accelerationStartThreshold;
@@ -79,6 +92,7 @@ classdef TestDrivingPreprocessing < matlab.unittest.TestCase
             session.data = table(sequenceNumber, hostTimestamp, sessionId, timeSeconds, ...
                 longitudinalAcceleration, lateralAcceleration, verticalAcceleration, ...
                 yawRate, callbackAgeMs);
+            session.sampleRateHz = config.targetSampleRateHz;
         end
     end
 end

@@ -3,6 +3,7 @@ function config = getDrivingAnalysisConfig()
 
 config = struct();
 config.targetSampleRateHz = 50;
+config.sampleRateToleranceHz = 0.5;
 config.maximumGapSamples = 2;
 config.segmentGapSeconds = 0.10;
 config.medianWindowSamples = 5;

@@ -56,6 +56,10 @@ classdef TestDrivingEventDetector < matlab.unittest.TestCase
             events = detectDrivingEvents(processed);
             testCase.verifyEqual(sum(string({events.type}) == ...
                 "ACCELERATION_CANDIDATE"), 2);
+            firstEvent = events(1);
+            secondEvent = events(2);
+            testCase.verifyLessThan(firstEvent.contextEndIndex, 136);
+            testCase.verifyGreaterThanOrEqual(secondEvent.contextStartIndex, 136);
         end
 
         function outlierCreatesNoEvents(testCase)
@@ -85,6 +89,24 @@ classdef TestDrivingEventDetector < matlab.unittest.TestCase
             summary = jsondecode(fileread(result.summaryJsonFile));
             testCase.verifyEqual(numel(events), 1);
             testCase.verifyEqual(summary.eventCounts.BRAKING_CANDIDATE, 1);
+            saved = load(result.resultMatFile, 'result');
+            testCase.verifyTrue(saved.result.success);
+            testCase.verifyEmpty(saved.result.errors);
+        end
+
+        function elapsedAndObservedDurationsHaveDistinctGapSemantics(testCase)
+            directory = createSyntheticDrivingSession( ...
+                testCase.TemporaryDirectory, "sequence_gap");
+            result = analyzeImuSession(directory, struct( ...
+                'AllowSynthetic', true, 'AllowMissingSamples', true, ...
+                'SaveAnalysis', false));
+            testCase.verifyTrue(result.success, strjoin(result.errors, ' '));
+            testCase.verifyEqual(result.elapsedDurationSeconds, 10.08, ...
+                'AbsTol', 1e-12);
+            testCase.verifyEqual(result.observedSampleDurationSeconds, 10, ...
+                'AbsTol', 1e-12);
+            testCase.verifyEqual(result.totalDurationSeconds, ...
+                result.elapsedDurationSeconds);
         end
     end
     methods (Access = private)
@@ -115,6 +137,7 @@ classdef TestDrivingEventDetector < matlab.unittest.TestCase
             zerosColumn = zeros(count, 1);
             processed = struct('sequenceNumber', sequence, ...
                 'hostTimestamp', hostTimestamp, 'timeSeconds', timeSeconds, ...
+                'sampleRateHz', config.targetSampleRateHz, ...
                 'callbackAgeMs', ones(count, 1), ...
                 'longitudinalFiltered', longitudinal, ...
                 'longitudinalJerk', zerosColumn, ...
