@@ -16,7 +16,7 @@ ylabel('Long. m/s^2'); grid on; markEvents(result.events, time, p.longitudinalFi
 subplot(5, 1, 2);
 yyaxis left; plot(time, p.lateralFiltered, 'LineWidth', 1); ylabel('Lateral m/s^2');
 yyaxis right; plot(time, p.yawRateFiltered, 'LineWidth', 1); ylabel('Yaw deg/s');
-grid on; markEvents(result.events, time, p.lateralFiltered, ...
+yyaxis left; grid on; markEvents(result.events, time, p.lateralFiltered, ...
     ["TURN_LEFT_CANDIDATE","TURN_RIGHT_CANDIDATE"]);
 
 subplot(5, 1, 3);
