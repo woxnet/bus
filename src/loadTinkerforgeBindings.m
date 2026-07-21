@@ -60,6 +60,8 @@ if status.classpathChangeRequired
     if ~status.jarAlreadyOnPath, additions(end+1, 1) = string(expectedJar); end
     if ~status.bridgeAlreadyOnPath, additions(end+1, 1) = string(expectedBridge); end
     dependencies.javaAddPath(cellstr(additions));
+    status.javaAddPathCalled = true;
+    status.pathsAdded = additions;
     status.jarAlreadyOnPath = true;
     status.bridgeAlreadyOnPath = true;
     status.classpathChangeRequired = false;
@@ -94,7 +96,9 @@ status = struct('available', false, 'jarInfo', info, ...
     'expectedBridgeSource', string(expectedBridge), ...
     'loadedSourcesMatch', false, 'restartRequired', false, ...
     'restartRecommended', false, 'errors', strings(0, 1), ...
-    'warnings', strings(0, 1));
+    'warnings', strings(0, 1), 'javaAddPathCalled', false, ...
+    'pathsAdded', strings(0, 1), ...
+    'runtimeCheckTimestamp', datetime('now', 'TimeZone', 'UTC'));
 end
 
 function dependencies = mergeDependencies(custom)

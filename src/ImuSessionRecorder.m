@@ -19,6 +19,7 @@ classdef ImuSessionRecorder < handle
         LastSequence = uint64(0)
         StreamSessionId = uint64(0)
         Gaps = zeros(0, 3)
+        RecordingTimer = []
     end
 
     methods
@@ -48,6 +49,7 @@ classdef ImuSessionRecorder < handle
             mkdir(char(obj.WorkingDirectory));
             obj.resetState();
             obj.writeMetadata("incomplete");
+            obj.RecordingTimer = tic;
             obj.Imu.start(obj.Options.callbackPeriodMs);
             stats = obj.Imu.getCallbackStats();
             obj.StreamSessionId = uint64(stats.sessionId);
@@ -156,6 +158,7 @@ classdef ImuSessionRecorder < handle
 
         function summary = makeSummary(obj, stats, status)
             summary = struct('sessionId', obj.SessionId, 'status', string(status), ...
+                'durationSeconds', obj.recordingDuration(), ...
                 'samplesWritten', obj.SamplesWritten, ...
                 'duplicateSamples', obj.DuplicateSamples, ...
                 'missingSamples', obj.MissingSamples, 'gaps', obj.Gaps, ...
@@ -164,6 +167,14 @@ classdef ImuSessionRecorder < handle
                 'coalesced', double(stats.coalesced), ...
                 'staleSessionDropped', double(stats.staleSessionDropped), ...
                 'chunkCount', obj.ChunkIndex);
+        end
+
+        function duration = recordingDuration(obj)
+            if isempty(obj.RecordingTimer)
+                duration = NaN;
+            else
+                duration = toc(obj.RecordingTimer);
+            end
         end
 
         function writeJson(~, filename, value)

@@ -116,6 +116,43 @@ chunks under ignored `sessions/` and marks interrupted sessions as incomplete.
 Synthetic calibration files are rejected by validation, loading, application,
 and recording unless an explicit test-only permission is supplied.
 
+## Acquisition acceptance gate
+
+Development of driving-quality algorithms starts only after all acquisition
+stages pass: startup acceptance, MATLAB unit tests, hardware preflight, the
+60-second FIFO hardware acceptance, and a 120-second raw recording. Run the
+startup check independently with:
+
+```matlab
+run("examples/run_startup_acceptance.m");
+```
+
+With the IMU connected, run the hardware acceptance and then record a session
+using a real, validated calibration for the configured bus ID and UID:
+
+```matlab
+run("examples/run_imu_hardware_acceptance.m");
+run("examples/run_imu_recording_acceptance.m");
+```
+
+Create the combined MAT and JSON result with
+`summarizeImuAcquisitionAcceptance`, for example after retaining the stage
+outputs in the operator workspace:
+
+```matlab
+summary = summarizeImuAcquisitionAcceptance( ...
+    third, results, preflightReport, report, recordedSession);
+```
+
+Then display the latest result with
+`run("examples/print_acquisition_acceptance.m")`. A summary can pass only when
+all five stages pass. Generated reports under `artifacts/` and chunked sessions
+under `sessions/` remain local and are ignored by Git.
+
+The GitHub MATLAB job targets R2021b and requires the repository Actions secret
+`MLM_LICENSE_TOKEN`. Java 8, 17, and 21 bridge jobs remain independent of that
+license secret.
+
 ## Installation calibration
 
 Only after successful hardware diagnostics, place the stationary bus on a

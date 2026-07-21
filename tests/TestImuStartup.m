@@ -29,6 +29,9 @@ classdef TestImuStartup < matlab.unittest.TestCase
             testCase.verifyEqual(runtime.AddPathCalls, 1);
             testCase.verifyEqual(numel(runtime.Paths), 2);
             testCase.verifyEqual(runtime.ConstructionCount, 0);
+            testCase.verifyTrue(status.javaAddPathCalled);
+            testCase.verifyEqual(numel(status.pathsAdded), 2);
+            testCase.verifyTrue(isdatetime(status.runtimeCheckTimestamp));
         end
 
         function repeatedLoadIsIdempotent(testCase)
@@ -43,6 +46,10 @@ classdef TestImuStartup < matlab.unittest.TestCase
             testCase.verifyTrue(all(cellfun(@(value)value.available, statuses)));
             testCase.verifyEqual(runtime.AddPathCalls, 1);
             testCase.verifyEmpty(warningIdentifier);
+            testCase.verifyFalse(statuses{2}.javaAddPathCalled);
+            testCase.verifyFalse(statuses{3}.javaAddPathCalled);
+            testCase.verifyEmpty(statuses{2}.pathsAdded);
+            testCase.verifyEmpty(statuses{3}.pathsAdded);
             testCase.verifyFalse(statuses{3}.classpathChangeRequired);
             testCase.verifyFalse(statuses{3}.restartRequired);
         end
