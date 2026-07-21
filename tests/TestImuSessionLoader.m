@@ -30,11 +30,22 @@ classdef TestImuSessionLoader < matlab.unittest.TestCase
             testCase.verifyEqual(session.sampleRateHz, 50);
             testCase.verifyEqual(report.sessionFormatVersion, 2);
             testCase.verifyFalse(report.legacySession);
-            testCase.verifyTrue(report.sampleRateMatchesAnalysis);
+            testCase.verifyTrue(isnan(report.sampleRateMatchesAnalysis));
+            testCase.verifyEqual(report.sessionStatus, "complete");
+            testCase.verifyTrue(report.metadataSummaryStatusMatch);
             testCase.verifyTrue(report.identityVerifiedPerSample);
             testCase.verifyFalse(report.rawSamplesRetained);
             testCase.verifyEmpty(session.rawSensorSamples);
             testCase.verifyGreaterThan(report.estimatedMemoryBytes, 0);
+            testCase.verifyEqual(report.timestampBackwardsCount, 0);
+            testCase.verifyEqual(report.timestampDuplicateCount, 0);
+            testCase.verifyEqual(report.maximumTimestampGapSeconds, 0.02, ...
+                'AbsTol', 1e-6);
+            testCase.verifyEqual(report.valid, isempty(report.errors));
+            [~, expectedReport] = loadImuSession(directory, struct( ...
+                'AllowSynthetic', true, 'ExpectedSampleRateHz', 50, ...
+                'SampleRateToleranceHz', 0.5));
+            testCase.verifyTrue(expectedReport.sampleRateMatchesAnalysis);
         end
 
         function missingChunkRejected(testCase)
@@ -85,17 +96,55 @@ classdef TestImuSessionLoader < matlab.unittest.TestCase
             testCase.verifyEqual(height(session.data), 500);
         end
 
-        function incompleteSessionRejectedByDefault(testCase)
+        function metadataCompleteSummaryIncompleteRejected(testCase)
             directory = createSyntheticDrivingSession( ...
                 testCase.TemporaryDirectory, "stationary");
-            filename = fullfile(directory, 'metadata.json');
-            metadata = jsondecode(fileread(filename)); metadata.status = 'incomplete';
-            testCase.writeJson(filename, metadata);
+            testCase.setStatus(directory, "summary.json", "incomplete");
+            [~, report] = loadImuSession(directory, struct( ...
+                'AllowSynthetic', true, 'AllowIncomplete', true));
+            testCase.verifyFalse(report.valid);
+            testCase.verifyFalse(report.metadataSummaryStatusMatch);
+            testCase.verifyTrue(any(report.errors == ...
+                "metadata and summary statuses differ."));
+        end
+
+        function summaryStatusIsRequired(testCase)
+            directory = createSyntheticDrivingSession( ...
+                testCase.TemporaryDirectory, "stationary");
+            filename = fullfile(directory, 'summary.json');
+            summary = jsondecode(fileread(filename));
+            summary = rmfield(summary, 'status');
+            testCase.writeJson(filename, summary);
+            [~, report] = loadImuSession(directory, struct('AllowSynthetic', true));
+            testCase.verifyFalse(report.valid);
+            testCase.verifyTrue(any(report.errors == "Missing summary field: status."));
+        end
+
+        function metadataIncompleteSummaryCompleteRejected(testCase)
+            directory = createSyntheticDrivingSession( ...
+                testCase.TemporaryDirectory, "stationary");
+            testCase.setStatus(directory, "metadata.json", "incomplete");
+            [~, report] = loadImuSession(directory, struct( ...
+                'AllowSynthetic', true, 'AllowIncomplete', true));
+            testCase.verifyFalse(report.valid);
+            testCase.verifyFalse(report.metadataSummaryStatusMatch);
+            testCase.verifyTrue(any(report.errors == ...
+                "metadata and summary statuses differ."));
+        end
+
+        function bothIncompleteRequireExplicitPermission(testCase)
+            directory = createSyntheticDrivingSession( ...
+                testCase.TemporaryDirectory, "stationary");
+            testCase.setStatus(directory, "metadata.json", "incomplete");
+            testCase.setStatus(directory, "summary.json", "incomplete");
             [~, rejected] = loadImuSession(directory, struct('AllowSynthetic', true));
             testCase.verifyFalse(rejected.valid);
+            testCase.verifyTrue(rejected.metadataSummaryStatusMatch);
             [~, accepted] = loadImuSession(directory, struct( ...
                 'AllowSynthetic', true, 'AllowIncomplete', true));
-            testCase.verifyTrue(accepted.valid);
+            testCase.verifyTrue(accepted.valid, strjoin(accepted.errors, ' '));
+            testCase.verifyEqual(accepted.sessionStatus, "incomplete");
+            testCase.verifyTrue(accepted.metadataSummaryStatusMatch);
         end
 
         function syntheticSessionNeedsExplicitPermission(testCase)
@@ -202,6 +251,29 @@ classdef TestImuSessionLoader < matlab.unittest.TestCase
             testCase.verifyEqual(majorReport.shortGapCount, 0);
             testCase.verifyEqual(majorReport.majorGapCount, 1);
         end
+
+        function backwardsTimestampIsReportedWithoutChangingSequenceTime(testCase)
+            directory = createSyntheticDrivingSession( ...
+                testCase.TemporaryDirectory, "stationary");
+            testCase.changeTimestampJump(directory, "backwards");
+            [session, report] = loadImuSession(directory, struct('AllowSynthetic', true));
+            testCase.verifyTrue(report.valid, strjoin(report.errors, ' '));
+            testCase.verifyEqual(report.timestampBackwardsCount, 1);
+            testCase.verifyEqual(report.timestampDuplicateCount, 0);
+            testCase.verifyTrue(any(contains(report.warnings, "backwards")));
+            testCase.verifyEqual(session.data.timeSeconds(251), 5, 'AbsTol', 1e-12);
+        end
+
+        function duplicateTimestampIsCountedSeparately(testCase)
+            directory = createSyntheticDrivingSession( ...
+                testCase.TemporaryDirectory, "stationary");
+            testCase.changeTimestampJump(directory, "duplicate");
+            [session, report] = loadImuSession(directory, struct('AllowSynthetic', true));
+            testCase.verifyTrue(report.valid, strjoin(report.errors, ' '));
+            testCase.verifyEqual(report.timestampBackwardsCount, 0);
+            testCase.verifyEqual(report.timestampDuplicateCount, 1);
+            testCase.verifyEqual(session.data.timeSeconds(251), 5, 'AbsTol', 1e-12);
+        end
     end
     methods (Access = private)
         function writeJson(~, filename, value)
@@ -259,6 +331,39 @@ classdef TestImuSessionLoader < matlab.unittest.TestCase
             summary = jsondecode(fileread(filename));
             summary.missingSamples = missingCount;
             testCase.writeJson(filename, summary);
+        end
+
+        function setStatus(testCase, directory, name, status)
+            filename = fullfile(directory, name);
+            value = jsondecode(fileread(filename));
+            value.status = status;
+            testCase.writeJson(filename, value);
+        end
+
+        function changeTimestampJump(~, directory, mode)
+            chunks = dir(fullfile(directory, 'samples_*.mat'));
+            globalIndex = 0;
+            previousTimestamp = NaT('TimeZone', 'UTC');
+            for chunk = chunks.'
+                filename = fullfile(chunk.folder, chunk.name);
+                contents = load(filename);
+                for index = 1:numel(contents.vehicleSamples)
+                    globalIndex = globalIndex + 1;
+                    if globalIndex == 251
+                        if mode == "backwards"
+                            contents.vehicleSamples{index}.hostTimestamp = ...
+                                previousTimestamp - seconds(1);
+                        else
+                            contents.vehicleSamples{index}.hostTimestamp = ...
+                                previousTimestamp;
+                        end
+                    end
+                    previousTimestamp = contents.vehicleSamples{index}.hostTimestamp;
+                end
+                sensorSamples = contents.sensorSamples;
+                vehicleSamples = contents.vehicleSamples;
+                save(filename, 'sensorSamples', 'vehicleSamples', '-v7');
+            end
         end
     end
 end

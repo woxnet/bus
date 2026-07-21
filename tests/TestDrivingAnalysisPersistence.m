@@ -49,6 +49,7 @@ classdef TestDrivingAnalysisPersistence < matlab.unittest.TestCase
             saved = load(result.resultMatFile, 'result');
             testCase.verifyTrue(saved.result.success);
             testCase.verifyEmpty(saved.result.errors);
+            testCase.verifyEqual(result.success, isempty(result.errors));
         end
 
         function outputDirectoryCanBeInjected(testCase)
@@ -82,6 +83,19 @@ classdef TestDrivingAnalysisPersistence < matlab.unittest.TestCase
             testCase.verifyFalse(result.loadReport.sampleRateMatchesAnalysis);
             testCase.verifyTrue(any(contains(result.errors, ...
                 "IMU:SessionSampleRateMismatch")));
+            testCase.verifyEqual(result.success, isempty(result.errors));
+        end
+
+        function customTargetRateIsPassedToLoader(testCase)
+            directory = testCase.session();
+            testCase.setSampleRate(directory, 40);
+            config = getDrivingAnalysisConfig();
+            config.targetSampleRateHz = 40;
+            result = analyzeImuSession(directory, struct( ...
+                'AllowSynthetic', true, 'SaveAnalysis', false, 'Config', config));
+            testCase.verifyTrue(result.success, strjoin(result.errors, ' '));
+            testCase.verifyTrue(result.loadReport.sampleRateMatchesAnalysis);
+            testCase.verifyEqual(result.processed.sampleRateHz, 40);
             testCase.verifyEqual(result.success, isempty(result.errors));
         end
     end

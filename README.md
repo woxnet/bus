@@ -149,8 +149,14 @@ result = analyzeImuSession("sessions/<legacy-session-id>", options);
 
 Legacy identity comes from metadata and is reported as not verified per
 sample. Format version 2 requires matching UID and bus ID in every sample.
+Metadata and summary statuses must also agree. Consistent `incomplete`
+sessions require the explicit `AllowIncomplete=true` option.
 The loader preallocates numeric arrays, does not retain raw cell structures by
 default, and supports `MaximumSamplesInMemory` as an explicit safety limit.
+Loader callers may provide `ExpectedSampleRateHz` and
+`SampleRateToleranceHz`; without an expected rate the match field is `NaN`.
+Host timestamps remain diagnostic only: backwards and duplicate timestamps
+are counted and warned about, while computational time remains sequence-based.
 The separate 500,000-sample integration test is available with:
 
 ```matlab

@@ -156,6 +156,15 @@ if ~isempty(gapIndices)
             report.missingSamples, report.shortGapCount, report.majorGapCount);
     end
 end
+timestampDifferences = seconds(diff(arrays.hostTimestamp));
+report.timestampBackwardsCount = sum(timestampDifferences < 0);
+report.timestampDuplicateCount = sum(timestampDifferences == 0);
+report.maximumTimestampGapSeconds = max([0; timestampDifferences(:)]);
+if report.timestampBackwardsCount > 0
+    report.warnings(end+1, 1) = sprintf( ...
+        'Session contains %d backwards host timestamp jumps; sequence time is unchanged.', ...
+        report.timestampBackwardsCount);
+end
 compareSummaryCounts();
 if ~isempty(report.errors), return; end
 
@@ -176,7 +185,7 @@ session = struct('data', data, 'metadata', metadata, 'summary', summary, ...
 report.rawSamplesRetained = options.KeepRawSamples;
 memoryInfo = whos('data', 'rawSensors', 'rawVehicles');
 report.estimatedMemoryBytes = sum([memoryInfo.bytes]);
-report.valid = true;
+report.valid = isempty(report.errors);
 
     function validateStatusAndIdentityMetadata()
         requiredMetadata = {'sessionId','uid','busId','status'};
@@ -186,10 +195,7 @@ report.valid = true;
                     "Missing metadata field: " + requiredMetadata{fieldIndex} + ".";
             end
         end
-        if ~isfield(metadata, 'status') || ...
-                (string(metadata.status) ~= "complete" && ~options.AllowIncomplete)
-            report.errors(end+1, 1) = "Session status is not complete.";
-        end
+        validateStatuses();
         if isfield(metadata, 'synthetic') && logical(metadata.synthetic) && ...
                 ~options.AllowSynthetic
             report.errors(end+1, 1) = "Synthetic session requires AllowSynthetic=true.";
@@ -198,6 +204,29 @@ report.valid = true;
                 string(summary.sessionId) ~= string(metadata.sessionId)
             report.errors(end+1, 1) = "metadata and summary session IDs differ.";
         end
+    end
+
+    function validateStatuses()
+        if ~isfield(summary, 'status')
+            report.errors(end+1, 1) = "Missing summary field: status.";
+            return;
+        end
+        if ~isfield(metadata, 'status'), return; end
+        metadataStatus = string(metadata.status);
+        summaryStatus = string(summary.status);
+        report.sessionStatus = metadataStatus;
+        report.metadataSummaryStatusMatch = metadataStatus == summaryStatus;
+        if ~report.metadataSummaryStatusMatch
+            report.errors(end+1, 1) = "metadata and summary statuses differ.";
+            return;
+        end
+        if metadataStatus == "complete"
+            return;
+        end
+        if metadataStatus == "incomplete" && options.AllowIncomplete
+            return;
+        end
+        report.errors(end+1, 1) = "Session status is not complete.";
     end
 
     function compareSummaryCounts()
@@ -217,8 +246,11 @@ report = struct('valid', false, 'sessionDirectory', string(sessionDirectory), ..
     'chunkCount', 0, 'samplesLoaded', 0, 'duplicateSamples', 0, ...
     'missingSamples', 0, 'gaps', zeros(0, 3), ...
     'sessionFormatVersion', 0, 'legacySession', false, ...
+    'sessionStatus', "", 'metadataSummaryStatusMatch', false, ...
     'sampleRateHz', NaN, 'callbackPeriodMs', NaN, ...
-    'sampleRateMatchesAnalysis', false, 'identityVerifiedPerSample', false, ...
+    'sampleRateMatchesAnalysis', NaN, 'identityVerifiedPerSample', false, ...
+    'timestampBackwardsCount', 0, 'timestampDuplicateCount', 0, ...
+    'maximumTimestampGapSeconds', 0, ...
     'shortGapCount', 0, 'majorGapCount', 0, 'rawSamplesRetained', false, ...
     'estimatedMemoryBytes', 0, 'errors', strings(0, 1), ...
     'warnings', strings(0, 1));
@@ -279,10 +311,18 @@ else
     report.callbackPeriodMs = values(3);
     report.identityVerifiedPerSample = true;
 end
-config = getDrivingAnalysisConfig();
-report.sampleRateMatchesAnalysis = ...
-    abs(report.sampleRateHz - config.targetSampleRateHz) <= ...
-    config.sampleRateToleranceHz;
+if ~isnan(options.ExpectedSampleRateHz)
+    report.sampleRateMatchesAnalysis = ...
+        abs(report.sampleRateHz - options.ExpectedSampleRateHz) <= ...
+        options.SampleRateToleranceHz;
+    if ~report.sampleRateMatchesAnalysis
+        report.errors(end+1, 1) = sprintf([ ...
+            'IMU:SessionSampleRateMismatch: Session rate %.6g Hz differs from ' ...
+            'expected rate %.6g Hz by more than %.6g Hz.'], ...
+            report.sampleRateHz, options.ExpectedSampleRateHz, ...
+            options.SampleRateToleranceHz);
+    end
+end
 valid = true;
 end
 
@@ -290,7 +330,8 @@ function options = parseOptions(custom)
 defaults = struct('AllowIncomplete', false, 'AllowMissingSamples', false, ...
     'AllowSynthetic', false, 'AllowLegacySession', false, ...
     'LegacySampleRateHz', NaN, 'KeepRawSamples', false, ...
-    'MaximumSamplesInMemory', Inf);
+    'MaximumSamplesInMemory', Inf, 'ExpectedSampleRateHz', NaN, ...
+    'SampleRateToleranceHz', NaN);
 if ~isstruct(custom) || ~isscalar(custom)
     error('IMU:InvalidSessionLoadOptions', 'options must be a scalar structure.');
 end
@@ -317,6 +358,27 @@ if ~(isnumeric(options.MaximumSamplesInMemory) && ...
         mod(options.MaximumSamplesInMemory, 1) == 0)))
     error('IMU:InvalidSessionLoadOptions', ...
         'MaximumSamplesInMemory must be a nonnegative integer or Inf.');
+end
+validateRateExpectation(options);
+end
+
+function validateRateExpectation(options)
+expected = options.ExpectedSampleRateHz;
+tolerance = options.SampleRateToleranceHz;
+if ~(isnumeric(expected) && isscalar(expected) && ...
+        (isnan(expected) || (isfinite(expected) && expected > 0)))
+    error('IMU:InvalidSessionLoadOptions', ...
+        'ExpectedSampleRateHz must be positive or NaN.');
+end
+if isnan(expected)
+    if ~(isnumeric(tolerance) && isscalar(tolerance) && isnan(tolerance))
+        error('IMU:InvalidSessionLoadOptions', ...
+            'SampleRateToleranceHz must be NaN when expected rate is not set.');
+    end
+elseif ~(isnumeric(tolerance) && isscalar(tolerance) && ...
+        isfinite(tolerance) && tolerance >= 0)
+    error('IMU:InvalidSessionLoadOptions', ...
+        'SampleRateToleranceHz must be nonnegative when expected rate is set.');
 end
 end
 
