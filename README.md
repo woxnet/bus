@@ -197,3 +197,30 @@ behavior from road geometry, potholes, vehicle vibration, sensor mounting
 errors, payload, or traffic context. Thresholds require validation against
 labeled real bus runs before operational use; detected events must not be
 treated as safety, disciplinary, or performance conclusions.
+
+## Real-time driving-event monitor
+
+Run `startup`, complete the hardware preflight, and create a real (not
+synthetic) installation calibration before starting the online monitor:
+
+```matlab
+run("examples/run_realtime_driving_monitor.m");
+```
+
+`RealtimeDrivingMonitor` is the only consumer of the IMU callback FIFO. It
+drains samples in sequence order, applies the mount calibration, and updates
+bounded causal EMA filters and stateful candidate detectors. This differs
+intentionally from the offline zero-phase filter, which can use future samples;
+online event boundaries can therefore lag the offline result slightly.
+
+The monitor reports braking, acceleration, left/right turn, and vertical-shock
+candidates through `OnEventStarted` and `OnEventCompleted`. `OnSample`,
+`OnWarning`, `OnError`, and `OnStopped` support other integrations. The live
+dashboard is throttled independently of detection. Optional session recording
+uses the recorder's external mode, so it receives each already-drained sample
+without reading the FIFO a second time. Stop a running instance with
+`summary = monitor.stop()`.
+
+This mode is IMU-only: it does not determine speed, trip boundaries, traffic
+context, or whether a maneuver is caused by the driver or the road. It produces
+candidate events and data-quality diagnostics, not a driving-quality score.

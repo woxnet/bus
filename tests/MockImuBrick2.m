@@ -18,6 +18,7 @@ classdef MockImuBrick2 < handle
         CallbackBufferedCount = uint64(0)
         LastCallbackSequence = uint64(0)
         CallbackSessionId = uint64(0)
+        DrainCallCount = 0
     end
     properties
         Samples
@@ -112,6 +113,7 @@ classdef MockImuBrick2 < handle
             if ~isempty(obj.CallbackQueue)
                 data = obj.CallbackQueue{1};
                 obj.CallbackQueue(1) = [];
+                obj.CallbackQueue = obj.CallbackQueue(:);
                 obj.CallbackBufferedCount = uint64(numel(obj.CallbackQueue));
                 obj.LatestData = data;
             end
@@ -130,6 +132,7 @@ classdef MockImuBrick2 < handle
             end
         end
         function samples = drainCallbackSamples(obj, maxCount)
+            obj.DrainCallCount = obj.DrainCallCount + 1;
             if nargin < 2, maxCount = Inf; end
             samples = cell(0, 1);
             while numel(samples) < maxCount
@@ -137,6 +140,40 @@ classdef MockImuBrick2 < handle
                 if isempty(sample), break; end
                 samples{end+1, 1} = sample; %#ok<AGROW>
             end
+        end
+        function injectCallbackSamples(obj, samples, sequences, callbackAgeMs)
+            if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
+            if nargin < 3 || isempty(sequences)
+                sequences = double(obj.LastCallbackSequence) + (1:numel(samples));
+            end
+            if nargin < 4, callbackAgeMs = 0; end
+            if isscalar(callbackAgeMs), callbackAgeMs = repmat(callbackAgeMs, numel(samples), 1); end
+            for index = 1:numel(samples)
+                sample = samples(index);
+                sample.source = "callback";
+                sample.sessionId = obj.CallbackSessionId;
+                sample.sequenceNumber = uint64(sequences(index));
+                if ~isfield(sample, 'hostTimestamp')
+                    sample.hostTimestamp = datetime('now', 'TimeZone', 'UTC');
+                end
+                if isempty(sample.hostTimestamp.TimeZone), sample.hostTimestamp.TimeZone = 'UTC'; end
+                sample.timestamp = sample.hostTimestamp;
+                sample.callbackAgeMs = double(callbackAgeMs(index));
+                sample.callbackDroppedTotal = obj.CallbackOverflowDroppedCount;
+                sample.callbackOverflowDroppedTotal = obj.CallbackOverflowDroppedCount;
+                sample.callbackCoalescedTotal = obj.CallbackCoalescedCount;
+                sample.callbackStaleSessionDroppedTotal = obj.CallbackStaleSessionDropCount;
+                if numel(obj.CallbackQueue) == obj.CallbackBufferCapacity
+                    obj.CallbackQueue(1) = [];
+                    obj.CallbackOverflowDroppedCount = obj.CallbackOverflowDroppedCount + uint64(1);
+                    obj.CallbackDroppedCount = obj.CallbackOverflowDroppedCount;
+                end
+                obj.CallbackQueue{end+1,1} = sample;
+                obj.LastCallbackSequence = uint64(sequences(index));
+                obj.CallbackGeneratedCount = obj.CallbackGeneratedCount + 1;
+                obj.CallbackReceivedCount = obj.CallbackReceivedCount + uint64(1);
+            end
+            obj.CallbackBufferedCount = uint64(numel(obj.CallbackQueue));
         end
         function clearCallbackBuffer(obj)
             obj.CallbackQueue = cell(0, 1);
