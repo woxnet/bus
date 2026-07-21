@@ -126,3 +126,42 @@ run("examples/run_imu_installation_calibration.m");
 ```
 
 Calibration is never started by `startup.m`.
+
+## Offline driving-event analysis
+
+Recorded `ImuSessionRecorder` directories can be analyzed without access to
+the IMU or Brick Daemon. The loader reads `metadata.json`, `summary.json`, and
+the ordered `samples_*.mat` chunks, and rejects incomplete, inconsistent, or
+gapped sessions by default. Missing-sample sessions may be inspected only with
+an explicit option; processing then creates independent continuous segments so
+filtering, derivatives, and event merging never cross a sequence gap.
+
+```matlab
+startup;
+result = analyzeImuSession("sessions/<session-id>");
+assert(result.success, strjoin(result.errors, " "));
+plotDrivingSessionAnalysis(result);
+```
+
+The analysis writes `analysis/result.mat`, `analysis/events.json`, and
+`analysis/summary.json` inside the session directory. Diagnostic plots are
+written as `analysis/diagnostic_plots.png` and `.fig`. Source recordings are
+never modified. To exercise the pipeline without hardware, tests must opt in
+to a session produced by `createSyntheticDrivingSession` using
+`AllowSynthetic=true`.
+
+Thresholds in `getDrivingAnalysisConfig` are preliminary engineering values:
+longitudinal acceleration starts at -1.5/1.2 m/s^2 for braking/acceleration,
+lateral acceleration at 1.5 m/s^2 with an 8 deg/s yaw-rate confirmation, and
+vertical shocks at 2.0 m/s^2 or 2.5 m/s^3 jerk. Each detector has weaker stop
+thresholds or explicit duration/merge rules to provide hysteresis.
+
+This is an IMU-only candidate-event detector, not a final driving-quality
+score. Without CAN or GNSS, it cannot reliably distinguish a stationary bus
+from one moving at constant speed. Consequently, this pipeline detects dynamic
+maneuvers but does not determine trip boundaries, distance travelled, events
+per kilometre, or vehicle speed. It also cannot reliably distinguish driver
+behavior from road geometry, potholes, vehicle vibration, sensor mounting
+errors, payload, or traffic context. Thresholds require validation against
+labeled real bus runs before operational use; detected events must not be
+treated as safety, disciplinary, or performance conclusions.
