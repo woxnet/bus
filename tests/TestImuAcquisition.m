@@ -70,6 +70,15 @@ classdef TestImuAcquisition < matlab.unittest.TestCase
             testCase.verifyEqual(session.duplicateSamples, 1);
             chunks = dir(fullfile(char(session.directory), 'samples_*.mat'));
             testCase.verifyGreaterThan(numel(chunks), 1);
+            metadata = jsondecode(fileread(fullfile(char(session.directory), ...
+                'metadata.json')));
+            summary = jsondecode(fileread(fullfile(char(session.directory), ...
+                'summary.json')));
+            testCase.verifyEqual(metadata.sessionFormatVersion, 2);
+            testCase.verifyEqual(summary.sessionFormatVersion, 2);
+            testCase.verifyEqual(metadata.sampleRateHz, 1000 / options.callbackPeriodMs);
+            testCase.verifyEqual(metadata.callbackPeriodMs, options.callbackPeriodMs);
+            testCase.verifyEqual(summary.sampleRateHz, metadata.sampleRateHz);
             for index = 1:numel(chunks)
                 contents = load(fullfile(chunks(index).folder, chunks(index).name));
                 testCase.verifyLessThanOrEqual(numel(contents.sensorSamples), 3);
