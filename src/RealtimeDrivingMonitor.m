@@ -69,6 +69,11 @@ classdef RealtimeDrivingMonitor < handle
         InternalWarnings=strings(0,1)
         LastStopSummary=[]
         StoppedCallbackInvoked=false
+        StopReason="operator_stop"
+        RecordingFinalStatus="complete"
+        RecorderFailed=false
+        UnrecordedSamplesAfterRecorderFailure=0
+        FatalStopRequested=false
     end
 
     methods
@@ -109,7 +114,8 @@ classdef RealtimeDrivingMonitor < handle
                     recorderOptions=struct('directory',obj.Config.recordingDirectory, ...
                         'callbackPeriodMs',obj.Config.callbackPeriodMs, ...
                         'maxPollSamples',obj.Config.maximumPollSamples, ...
-                        'AllowSynthetic',obj.Config.AllowSyntheticCalibration);
+                        'AllowSynthetic',obj.Config.AllowSyntheticCalibration, ...
+                        'maximumSessionBytes',obj.Config.maximumSessionBytes);
                     factory=obj.Dependencies.createRecorder;
                     obj.Recorder=factory(obj.Imu,obj.Calibration,recorderOptions);
                     obj.OwnsRecorder=true; obj.Recorder.startExternal();
@@ -126,6 +132,8 @@ classdef RealtimeDrivingMonitor < handle
                 end
                 obj.IsRunning=true;
                 if obj.Config.UseTimer, start(obj.Timer); end
+                obj.evaluateRecordingGuards();
+                if obj.FatalStopRequested, obj.stop(); end
             catch exception
                 obj.rollbackStart();
                 obj.recordInternalError(exception);
@@ -147,11 +155,12 @@ classdef RealtimeDrivingMonitor < handle
                 if ~obj.IsRunning || obj.IsStopping, return; end
                 samples=obj.Imu.drainCallbackSamples(obj.Config.maximumPollSamples);
                 for index=1:numel(samples)
-                    if ~obj.IsRunning || obj.IsStopping, break; end
                     obj.processSample(samples{index},overflow);
                 end
                 obj.OverflowSincePreviousPoll=false;
                 obj.ConsecutiveErrors=0;
+                obj.evaluateRecordingGuards();
+                if obj.FatalStopRequested && obj.IsRunning, obj.stop(); end
             catch exception
                 obj.ConsecutiveErrors=obj.ConsecutiveErrors+1;
                 obj.recordInternalError(exception);
@@ -209,7 +218,7 @@ classdef RealtimeDrivingMonitor < handle
             end
             if obj.OwnsRecorder && ~isempty(obj.Recorder) && obj.Recorder.IsRecording
                 try
-                    recording=obj.Recorder.stopExternal(finalStats);
+                    recording=obj.Recorder.stopExternal(finalStats,obj.RecordingFinalStatus,obj.StopReason);
                 catch exception
                     obj.recordInternalError(exception);
                     try
@@ -221,6 +230,13 @@ classdef RealtimeDrivingMonitor < handle
             end
             try
                 obj.Imu.clearCallbackBuffer();
+            catch exception
+                obj.recordInternalError(exception);
+            end
+            try
+                if ismethod(obj.Imu,'releaseStreamOwner')
+                    obj.Imu.releaseStreamOwner("RealtimeDrivingMonitor");
+                end
             catch exception
                 obj.recordInternalError(exception);
             end
@@ -259,6 +275,9 @@ classdef RealtimeDrivingMonitor < handle
             obj.OverflowSincePreviousPoll=false;
             obj.InternalErrors=strings(0,1); obj.InternalWarnings=strings(0,1);
             obj.LastStopSummary=[]; obj.StoppedCallbackInvoked=false;
+            obj.StopReason="operator_stop"; obj.RecordingFinalStatus="complete";
+            obj.RecorderFailed=false; obj.UnrecordedSamplesAfterRecorderFailure=0;
+            obj.FatalStopRequested=false;
             obj.Recorder=[]; obj.OwnsRecorder=false; obj.Dashboard=[]; obj.Timer=[];
             obj.resetProcessingState(); obj.PendingEvents=cell(5,1);
             sampleCapacity=max(1,ceil(obj.Config.historySeconds*obj.Config.sampleRateHz));
@@ -280,7 +299,11 @@ classdef RealtimeDrivingMonitor < handle
             samples=obj.cellBufferToStruct(samples);
         end
         function stats=getStats(obj)
-            stats=obj.makeSummary([],0,0,false);
+            if ~obj.IsRunning && ~isempty(obj.LastStopSummary)
+                stats=obj.LastStopSummary;
+            else
+                stats=obj.makeSummary([],0,0,false);
+            end
         end
         function delete(obj)
             try
@@ -311,6 +334,7 @@ classdef RealtimeDrivingMonitor < handle
                 'createRecorder',@(imu,calibration,options)ImuSessionRecorder(imu,calibration,options), ...
                 'monotonicClockStart',@tic,'monotonicClockElapsed',@toc, ...
                 'sleep',@pause);
+            defaults.getFreeDiskBytes=@freeDiskBytes;
             if ~isstruct(custom) || ~isscalar(custom)
                 error('IMU:InvalidRealtimeDependencies','dependencies must be a scalar struct.');
             end
@@ -409,9 +433,24 @@ classdef RealtimeDrivingMonitor < handle
             obj.LatestProcessedSample=processed; obj.SamplesProcessed=obj.SamplesProcessed+1;
             obj.publishExpiredPending(processed); obj.updateEvents(processed); obj.appendSampleHistory(processed);
             if obj.OwnsRecorder && ~isempty(obj.Recorder) && obj.Recorder.IsRecording
-                obj.Recorder.appendSample(sensor,vehicle);
+                if obj.RecorderFailed
+                    obj.UnrecordedSamplesAfterRecorderFailure= ...
+                        obj.UnrecordedSamplesAfterRecorderFailure+1;
+                else
+                    try
+                        obj.Recorder.appendSample(sensor,vehicle);
+                    catch exception
+                        obj.RecorderFailed=true;
+                        obj.UnrecordedSamplesAfterRecorderFailure= ...
+                            obj.UnrecordedSamplesAfterRecorderFailure+1;
+                        obj.StopReason="recorder_failure";
+                        obj.RecordingFinalStatus="incomplete";
+                        obj.FatalStopRequested=true;
+                        obj.recordInternalError(exception);
+                    end
+                end
             end
-            if ~isempty(obj.Dashboard), obj.Dashboard.update(processed); end
+            obj.updateDashboardSafely(processed);
             obj.invokeCallback(obj.OnSample,processed);
         end
         function valid=validSequenceMetadata(~,sample)
@@ -601,7 +640,9 @@ classdef RealtimeDrivingMonitor < handle
                 'startedAt',obj.StartedAt,'stoppedAt',obj.StoppedAt, ...
                 'sampleHistoryCount',obj.SampleHistoryCount,'eventHistoryCount',obj.EventHistoryCount, ...
                 'tailSamplesDrained',double(tailSamples),'stopDrainDurationSeconds',double(drainDuration), ...
-                'stopDrainTimedOut',logical(drainTimedOut),'recording',recording,'lastError',obj.LastError);
+                'stopDrainTimedOut',logical(drainTimedOut),'recording',recording,'lastError',obj.LastError, ...
+                'stopReason',obj.StopReason, ...
+                'unrecordedSamplesAfterRecorderFailure',obj.UnrecordedSamplesAfterRecorderFailure);
             summary.finalCallbackStats=obj.FinalCallbackStats;
         end
         function recordInternalError(obj,exception)
@@ -613,6 +654,45 @@ classdef RealtimeDrivingMonitor < handle
             info.source="realtime"; info.status="observed"; info.timestamp=datetime('now','TimeZone','UTC');
             obj.DataQualityEventsDetected=obj.DataQualityEventsDetected+1; obj.LatestDataQualityEvent=info;
             obj.InternalWarnings(end+1,1)=string(info.type); obj.invokeCallback(obj.OnWarning,info);
+        end
+        function recordOperationalWarning(obj,type,message)
+            obj.InternalWarnings(end+1,1)=string(type)+": "+string(message);
+            info=struct('type',string(type),'message',string(message), ...
+                'source',"realtime",'status',"controlled_stop", ...
+                'timestamp',datetime('now','TimeZone','UTC'));
+            obj.invokeCallback(obj.OnWarning,info);
+        end
+        function updateDashboardSafely(obj,processed)
+            if isempty(obj.Dashboard), return; end
+            try
+                obj.Dashboard.update(processed);
+            catch exception
+                obj.recordOperationalWarning("DASHBOARD_UPDATE_FAILED",exception.message);
+            end
+        end
+        function evaluateRecordingGuards(obj)
+            if ~obj.Config.enableRecording || isempty(obj.Recorder) || ...
+                    ~obj.Recorder.IsRecording || obj.FatalStopRequested
+                return;
+            end
+            reason=""; message="";
+            if obj.monotonicElapsed()>=obj.Config.maximumRecordingDurationSeconds
+                reason="maximum_recording_duration";
+                message="Maximum recording duration reached.";
+            else
+                freeBytes=obj.Dependencies.getFreeDiskBytes(obj.Config.recordingDirectory);
+                if freeBytes<obj.Config.minimumFreeDiskBytes
+                    reason="minimum_free_disk"; message="Minimum free disk reserve reached.";
+                elseif ismethod(obj.Recorder,'getSessionBytes') && ...
+                        obj.Recorder.getSessionBytes()>=obj.Config.maximumSessionBytes
+                    reason="maximum_session_bytes"; message="Maximum session size reached.";
+                end
+            end
+            if strlength(reason)>0
+                obj.StopReason=reason; obj.RecordingFinalStatus="incomplete";
+                obj.FatalStopRequested=true;
+                obj.recordOperationalWarning(upper(reason),message);
+            end
         end
         function invokeCallback(obj,callback,payload)
             if isempty(callback), return; end
@@ -631,6 +711,7 @@ classdef RealtimeDrivingMonitor < handle
             end
             obj.cleanupAction(@()obj.Imu.quiesce(),"IMU quiesce rollback");
             obj.cleanupAction(@()obj.Imu.clearCallbackBuffer(),"IMU buffer rollback");
+            obj.cleanupAction(@()obj.releaseOwnedStream(),"IMU owner rollback");
             obj.IsRunning=false; obj.IsStopping=false;
         end
         function forceStoppedState(obj)
@@ -641,6 +722,7 @@ classdef RealtimeDrivingMonitor < handle
                 obj.cleanupAction(@()delete(obj.Recorder),"recorder final cleanup");
             end
             obj.cleanupAction(@()obj.Imu.clearCallbackBuffer(),"IMU buffer final cleanup");
+            obj.cleanupAction(@()obj.releaseOwnedStream(),"IMU owner final cleanup");
             obj.cleanupAction(@()obj.closeDashboard(),"dashboard final cleanup");
             obj.IsRunning=false; obj.IsStopping=false;
         end
@@ -672,6 +754,13 @@ classdef RealtimeDrivingMonitor < handle
             if isempty(obj.Dashboard), return; end
             dashboard=obj.Dashboard; obj.Dashboard=[]; dashboard.close();
         end
+        function releaseOwnedStream(obj)
+            if ismethod(obj.Imu,'releaseStreamOwner') && ...
+                    isprop(obj.Imu,'StreamOwner') && ...
+                    string(obj.Imu.StreamOwner)=="RealtimeDrivingMonitor"
+                obj.Imu.releaseStreamOwner("RealtimeDrivingMonitor");
+            end
+        end
         function values=orderedBuffer(~,buffer,count,lastIndex)
             if count==0, values=cell(0,1); return; end
             capacity=numel(buffer); first=mod(lastIndex-count,capacity)+1;
@@ -684,4 +773,15 @@ classdef RealtimeDrivingMonitor < handle
         function timerPoll(obj), obj.poll(); end
         function restoreTimerOption(obj,value), obj.Config.UseTimer=value; end
     end
+end
+
+function bytes=freeDiskBytes(directory)
+path=resolveProjectPath(directory);
+while ~isfolder(path)
+    parent=fileparts(path);
+    if strcmp(parent,path), break; end
+    path=parent;
+end
+file=javaObject('java.io.File',char(path));
+bytes=double(file.getUsableSpace());
 end

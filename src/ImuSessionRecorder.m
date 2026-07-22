@@ -76,7 +76,9 @@ classdef ImuSessionRecorder < handle
             appended = obj.appendPreparedSample(sample, vehicle);
         end
 
-        function session = stopExternal(obj, stats)
+        function session = stopExternal(obj, stats, status, reason)
+            if nargin<3 || isempty(status), status="complete"; end
+            if nargin<4, reason="operator_stop"; end
             if ~obj.IsRecording || ~obj.ExternalMode
                 error('IMU:RecorderNotExternal', 'External recorder is not active.');
             end
@@ -85,7 +87,7 @@ classdef ImuSessionRecorder < handle
                     'Quiesce the IMU before finalizing an external recording.');
             end
             obj.flushChunk();
-            session = obj.finalize(stats);
+            session = obj.finalize(stats,string(status),string(reason));
         end
 
         function session = stop(obj)
@@ -97,7 +99,15 @@ classdef ImuSessionRecorder < handle
             obj.flushChunk();
             stats = obj.Imu.getCallbackStats();
             obj.Imu.stop();
-            session = obj.finalize(stats);
+            session = obj.finalize(stats,"complete","operator_stop");
+        end
+
+        function bytes=getSessionBytes(obj)
+            bytes=0;
+            if strlength(obj.WorkingDirectory)>0 && isfolder(obj.WorkingDirectory)
+                entries=dir(fullfile(char(obj.WorkingDirectory),'**','*'));
+                if ~isempty(entries), bytes=sum(double([entries(~[entries.isdir]).bytes])); end
+            end
         end
 
         function delete(obj)
@@ -151,15 +161,21 @@ classdef ImuSessionRecorder < handle
             if numel(obj.SensorBuffer) >= obj.Options.chunkSize, obj.flushChunk(); end
         end
 
-        function session = finalize(obj, stats)
-            summary = obj.makeSummary(stats, "complete");
+        function session = finalize(obj, stats, status, reason)
+            summary = obj.makeSummary(stats, status);
+            summary.stopReason=string(reason);
             obj.writeJson(fullfile(char(obj.WorkingDirectory), 'summary.json'), summary);
-            obj.writeMetadata("complete");
-            [success, message] = movefile(char(obj.WorkingDirectory), ...
-                char(obj.FinalDirectory));
-            if ~success, error('IMU:RecorderFinalizeFailed', '%s', message); end
+            obj.writeMetadata(status);
+            if status=="complete"
+                [success, message] = movefile(char(obj.WorkingDirectory), ...
+                    char(obj.FinalDirectory));
+                if ~success, error('IMU:RecorderFinalizeFailed', '%s', message); end
+                directory=obj.FinalDirectory;
+            else
+                directory=obj.WorkingDirectory;
+            end
             obj.IsRecording = false; obj.ExternalMode = false;
-            session = summary; session.directory = obj.FinalDirectory;
+            session = summary; session.directory = directory;
         end
 
         function resetState(obj)
@@ -230,7 +246,7 @@ classdef ImuSessionRecorder < handle
             config = getImuConfig();
             options = struct('directory', 'sessions', 'chunkSize', 1000, ...
                 'maxPollSamples', 256, 'callbackPeriodMs', config.callbackPeriodMs, ...
-                'AllowSynthetic', false);
+                'AllowSynthetic', false,'maximumSessionBytes',20*1024^3);
             if ~isstruct(custom) || ~isscalar(custom)
                 error('IMU:InvalidRecorderOptions', 'options must be a scalar struct.');
             end
@@ -243,6 +259,8 @@ classdef ImuSessionRecorder < handle
             validateattributes(options.chunkSize, {'numeric'}, {'scalar','integer','positive'});
             validateattributes(options.maxPollSamples, {'numeric'}, {'scalar','integer','positive'});
             validateattributes(options.callbackPeriodMs, {'numeric'}, {'scalar','positive'});
+            validateattributes(options.maximumSessionBytes, {'numeric'}, ...
+                {'scalar','real','finite','positive'});
             if ~(islogical(options.AllowSynthetic) && isscalar(options.AllowSynthetic))
                 error('IMU:InvalidRecorderOptions', 'AllowSynthetic must be logical.');
             end

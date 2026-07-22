@@ -104,16 +104,29 @@ classdef MockImuBrick2 < handle
         end
         function claimStreamOwner(obj,owner)
             if obj.IsStreaming, error('IMU:StreamAlreadyActive','Stream is active.'); end
-            obj.StreamOwner=string(owner);
+            owner=string(owner);
+            if obj.StreamOwner~="none" && obj.StreamOwner~=owner
+                error('IMU:StreamOwnerConflict','Stream is owned by %s.',obj.StreamOwner);
+            end
+            obj.StreamOwner=owner;
+        end
+        function releaseStreamOwner(obj,expectedOwner)
+            expectedOwner=string(expectedOwner);
+            if obj.IsStreaming, error('IMU:StreamStillActive','Stream is active.'); end
+            if obj.StreamOwner~=expectedOwner
+                error('IMU:StreamOwnerMismatch','Unexpected stream owner.');
+            end
+            obj.StreamOwner="none";
         end
         function stop(obj)
+            owner=obj.StreamOwner;
             obj.quiesce();
             obj.clearCallbackBuffer();
+            if owner~="none", obj.releaseStreamOwner(owner); end
         end
         function quiesce(obj)
             obj.updateCallbacks();
             obj.IsStreaming = false;
-            obj.StreamOwner = "none";
             obj.QuiesceCount = obj.QuiesceCount + 1;
             if obj.FailQuiesce, error('MockImu:QuiesceFailure','Injected quiesce failure.'); end
         end
@@ -250,6 +263,7 @@ classdef MockImuBrick2 < handle
         function disconnect(obj)
             obj.IsStreaming = false;
             obj.clearCallbackBuffer();
+            obj.StreamOwner = "none";
             obj.DisconnectCount = obj.DisconnectCount + 1;
         end
     end

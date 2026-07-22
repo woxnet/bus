@@ -99,6 +99,10 @@ wasStreaming = logical(imu.IsStreaming);
 previousPeriod = double(imu.StreamingPeriodMs);
 previousOwner = "callback";
 if isprop(imu,'StreamOwner'), previousOwner=string(imu.StreamOwner); end
+if wasStreaming && ~any(previousOwner==["none","callback"])
+    error('IMU:DiagnosticsRequiresExclusiveAccess', ...
+        'Diagnostics cannot stop a stream owned by %s.',previousOwner);
+end
 streamCleanup = onCleanup(@()restoreStream(imu, wasStreaming, previousPeriod,previousOwner));
 if wasStreaming, imu.stop(); end
 

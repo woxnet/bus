@@ -20,6 +20,7 @@ classdef ImuInstallationCalibrationController < handle
         ActivationVerified = false
         RollbackAttempted = false
         RollbackSucceeded = false
+        CancelReason = ""
     end
     properties
         OnStateChanged = []
@@ -95,11 +96,36 @@ classdef ImuInstallationCalibrationController < handle
             end
         end
 
-        function cancel(obj)
+        function cancel(obj,reason)
+            if nargin<2 || strlength(string(reason))==0, reason="operator_cancelled"; end
             obj.CancelRequested = true;
+            if strlength(obj.CancelReason)==0, obj.CancelReason=string(reason); end
             obj.ConfirmationPending = false;
             if ~isempty(obj.Calibrator)
                 try, obj.Calibrator.cancel(); catch, end
+            end
+        end
+
+        function close(obj)
+            %CLOSE Cooperatively cancel and wait for an asynchronous workflow.
+            if obj.IsRunning, obj.cancel("controller_closed"); end
+            started=tic;
+            while obj.IsRunning && toc(started)<5
+                drawnow;
+                obj.Dependencies.sleep(min(obj.Options.pollStatusSeconds,0.05));
+            end
+            if obj.IsRunning
+                warning('IMU:CalibrationCloseTimedOut', ...
+                    'Calibration did not reach a cancellation checkpoint before close timeout.');
+                return;
+            end
+            obj.destroyTimer();
+            if ~obj.Options.keepFailedWorkingFiles && ~obj.PreserveDiagnostics
+                obj.safeDeleteWorking();
+            end
+            if ~isempty(obj.Dashboard)
+                try, delete(obj.Dashboard); catch, end
+                obj.Dashboard=[];
             end
         end
 
@@ -150,12 +176,7 @@ classdef ImuInstallationCalibrationController < handle
         function delete(obj)
             if obj.Deleting, return; end
             obj.Deleting = true;
-            obj.cancel();
-            obj.destroyTimer();
-            if ~obj.Options.keepFailedWorkingFiles && ~obj.PreserveDiagnostics, obj.safeDeleteWorking(); end
-            if ~isempty(obj.Dashboard)
-                try, delete(obj.Dashboard); catch, end
-            end
+            obj.close();
         end
     end
 
@@ -163,6 +184,7 @@ classdef ImuInstallationCalibrationController < handle
         function beginRun(obj)
             obj.IsRunning = true;
             obj.CancelRequested = false;
+            obj.CancelReason = "";
             obj.StartedAt = obj.Dependencies.nowUtc();
             obj.CompletedAt = NaT;
             obj.LastError = [];
@@ -241,10 +263,10 @@ classdef ImuInstallationCalibrationController < handle
                 obj.setStatus("READY",1,"Installation calibration is ready.");
                 obj.finishSuccess();
             catch exception
-                obj.recordError(exception);
                 if strcmp(exception.identifier,'IMU:CalibrationCancelled') || obj.CancelRequested
                     obj.finishCancelled();
                 else
+                    obj.recordError(exception);
                     obj.finishFailure(exception);
                 end
             end
@@ -252,15 +274,15 @@ classdef ImuInstallationCalibrationController < handle
 
         function acquireExclusiveAccess(obj)
             streaming = isprop(obj.Imu,'IsStreaming') && logical(obj.Imu.IsStreaming);
-            if ~streaming, return; end
-            if ~obj.Options.StopExistingStream
-                error('IMU:CalibrationRequiresExclusiveAccess', ...
-                    'Stop the active IMU consumer before calibration.');
-            end
             if isprop(obj.Imu,'StreamOwner') && ...
                     ~any(string(obj.Imu.StreamOwner)==["none","callback"])
                 error('IMU:CalibrationRequiresExclusiveAccess', ...
                     'An active monitor or recorder owns the IMU stream.');
+            end
+            if ~streaming, return; end
+            if ~obj.Options.StopExistingStream
+                error('IMU:CalibrationRequiresExclusiveAccess', ...
+                    'Stop the active IMU consumer before calibration.');
             end
             obj.PreviousStreamingPeriodMs = double(obj.Imu.StreamingPeriodMs);
             obj.Imu.stop();
@@ -372,6 +394,10 @@ classdef ImuInstallationCalibrationController < handle
         function persistCandidate(obj)
             directory = fileparts(char(obj.FinalFile));
             if ~isfolder(directory), mkdir(directory); end
+            if isfile(obj.FinalFile) && ~obj.Options.backupExistingCalibration
+                error('IMU:CalibrationBackupRequired', ...
+                    'An existing final calibration must be backed up before replacement.');
+            end
             if isfile(obj.FinalFile) && obj.Options.backupExistingCalibration
                 obj.checkCancelled();
                 archive = fullfile(directory,'archive');
@@ -429,6 +455,7 @@ classdef ImuInstallationCalibrationController < handle
 
         function finishCancelled(obj)
             obj.State="CANCELLED"; obj.Message="Calibration cancelled.";
+            obj.LastError=[];
             obj.IsRunning=false; obj.CompletedAt=obj.Dependencies.nowUtc();
             obj.safeDeleteWorking(); obj.restoreStreamIfAllowed(false); obj.destroyTimer();
             obj.Result=obj.makeResult(); obj.safeCallback(obj.OnCancelled,obj.Result);
@@ -489,6 +516,7 @@ classdef ImuInstallationCalibrationController < handle
                 'finalFile',obj.FinalFile,'backupFile',obj.BackupFile, ...
                 'workingFile',obj.WorkingFile,'startedAt',obj.StartedAt, ...
                 'completedAt',obj.CompletedAt,'errors',errors,'warnings',warnings);
+            result.cancelReason=obj.CancelReason;
             result.errorIdentifier=""; result.errorMessage="";
             if ~isempty(obj.LastError)
                 result.errorIdentifier=string(obj.LastError.identifier);

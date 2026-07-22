@@ -43,7 +43,30 @@ classdef TestImuInstallationCalibrationController < matlab.unittest.TestCase
                 @(~)false,testCase.preflight(true));
             result=controller.runBlocking();
             testCase.verifyTrue(result.cancelled); testCase.verifyEqual(result.state,"CANCELLED");
+            testCase.verifyEqual(result.cancelReason,"operator_cancelled");
+            testCase.verifyEmpty(result.errors); testCase.verifyEmpty(result.errorIdentifiers);
             delete(controller);
+        end
+        function cooperativeAsyncCloseCancelsSafely(testCase)
+            folder=testCase.tempFolder(); imu=MockImuBrick2(testCase.samples());
+            options=testCase.options(folder);
+            dependencies=testCase.dependencies(testCase.preflight(true),@(~)true);
+            dependencies.createTimer=@(varargin)timer(varargin{:},'StartDelay',0.05);
+            controller=ImuInstallationCalibrationController(imu,getImuConfig().busId,folder,options,dependencies);
+            controller.start(); controller.close(); result=controller.wait();
+            testCase.verifyTrue(result.cancelled);
+            testCase.verifyEqual(result.cancelReason,"controller_closed");
+            testCase.verifyEmpty(result.errors); delete(controller);
+        end
+        function asynchronousDeleteWaitsForCooperativeCancellation(testCase)
+            folder=testCase.tempFolder(); imu=MockImuBrick2(testCase.samples());
+            options=testCase.options(folder);
+            dependencies=testCase.dependencies(testCase.preflight(true),@(~)true);
+            dependencies.createTimer=@(varargin)timer(varargin{:},'StartDelay',0.05);
+            controller=ImuInstallationCalibrationController(imu,getImuConfig().busId,folder,options,dependencies);
+            controller.start(); delete(controller);
+            testCase.verifyFalse(isvalid(controller));
+            testCase.verifyFalse(imu.IsStreaming);
         end
         function repeatedStartRejected(testCase)
             controller=testCase.controller(testCase.tempFolder(),testCase.samples(), ...
@@ -70,6 +93,18 @@ classdef TestImuInstallationCalibrationController < matlab.unittest.TestCase
             testCase.verifyFalse(result.success); testCase.verifyTrue(imu.IsStreaming);
             testCase.verifyEqual(imu.StreamOwner,"RealtimeDrivingMonitor");
             delete(controller); imu.stop();
+        end
+        function calibrationCannotClaimQuiescedMonitorStream(testCase)
+            imu=MockImuBrick2(testCase.samples());
+            imu.claimStreamOwner("RealtimeDrivingMonitor"); imu.start(20); imu.quiesce();
+            options=testCase.options(testCase.tempFolder()); options.StopExistingStream=true;
+            controller=ImuInstallationCalibrationController(imu,getImuConfig().busId, ...
+                options.calibrationDirectory,options,testCase.dependencies(testCase.preflight(true),@(~)true));
+            result=controller.runBlocking();
+            testCase.verifyFalse(result.success);
+            testCase.verifyEqual(result.errorIdentifier,"IMU:CalibrationRequiresExclusiveAccess");
+            testCase.verifyEqual(imu.StreamOwner,"RealtimeDrivingMonitor");
+            delete(controller); imu.clearCallbackBuffer(); imu.releaseStreamOwner("RealtimeDrivingMonitor");
         end
         function callbackFailureIsContained(testCase)
             controller=testCase.controller(testCase.tempFolder(),testCase.samples(), ...

@@ -16,6 +16,7 @@ classdef RealtimeDependencyProbe < handle
         ClockElapsed=1
         ClockStep=0
         SleepCalls=0
+        FreeDiskBytes=Inf
     end
     methods
         function value=dependencies(obj)
@@ -25,7 +26,8 @@ classdef RealtimeDependencyProbe < handle
                 'createRecorder',@(imu,calibration,options)obj.createRecorder(imu,calibration,options), ...
                 'monotonicClockStart',@()uint64(1), ...
                 'monotonicClockElapsed',@(~)obj.elapsed(), ...
-                'sleep',@(seconds)obj.sleep(seconds));
+                'sleep',@(seconds)obj.sleep(seconds), ...
+                'getFreeDiskBytes',@(~)obj.FreeDiskBytes);
         end
         function assertRuntime(obj)
             obj.RuntimeCalls=obj.RuntimeCalls+1;

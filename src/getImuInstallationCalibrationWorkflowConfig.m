@@ -22,5 +22,6 @@ config.maximumVerificationStationaryLinearAcceleration = 0.20;
 config.minimumVerificationForwardCoherence = 0.85;
 config.backupExistingCalibration = true;
 config.keepFailedWorkingFiles = false;
+config.AllowUnverifiedLegacyCalibration = false;
 config = validateImuInstallationCalibrationWorkflowConfig(config);
 end

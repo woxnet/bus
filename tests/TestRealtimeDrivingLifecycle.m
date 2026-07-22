@@ -61,9 +61,80 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
             imu.injectCallbackSamples(samples); before=imu.getCallbackStats();
             imu.quiesce(); after=imu.getCallbackStats();
             testCase.verifyFalse(imu.IsStreaming); testCase.verifyEqual(after.sessionId,before.sessionId);
+            testCase.verifyEqual(imu.StreamOwner,"callback");
+            testCase.verifyError(@()imu.claimStreamOwner("competitor"), ...
+                'IMU:StreamOwnerConflict');
             testCase.verifyEqual(after.buffered,uint64(4));
             testCase.verifyEqual(numel(imu.drainCallbackSamples(10)),4);
             imu.stop(); testCase.verifyGreaterThan(imu.getCallbackStats().sessionId,after.sessionId);
+        end
+        function monitorOwnerSurvivesQuiesceDrainAndFinalization(testCase)
+            probe=RealtimeDependencyProbe();
+            [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableRecording',true)); %#ok<ASGLU>
+            monitor.startManual(); imu.injectCallbackSamples(testCase.samples(3,0,0,0));
+            summary=monitor.stop();
+            testCase.verifyEqual(probe.Recorder.FinalizedStreamOwner,"RealtimeDrivingMonitor");
+            testCase.verifyEqual(imu.StreamOwner,"none");
+            testCase.verifyEqual(summary.tailSamplesDrained,3);
+        end
+        function dashboardFailureDoesNotLoseDrainedBatch(testCase)
+            probe=RealtimeDependencyProbe();
+            [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableLivePlot',true)); %#ok<ASGLU>
+            monitor.startManual(); probe.Dashboard.FailOnUpdate=true;
+            imu.injectCallbackSamples(testCase.samples(20,0,0,0)); monitor.poll();
+            testCase.verifyEqual(monitor.SamplesProcessed,20);
+            testCase.verifyEqual(probe.Dashboard.UpdateCount,20);
+            testCase.verifyTrue(monitor.IsRunning); summary=monitor.stop();
+            testCase.verifyTrue(any(contains(summary.warnings,"DASHBOARD_UPDATE_FAILED")));
+        end
+        function recorderFailureDiagnosesEntireDrainedBatch(testCase)
+            probe=RealtimeDependencyProbe();
+            [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableRecording',true)); %#ok<ASGLU>
+            monitor.startManual(); probe.Recorder.FailOnAppendNumber=1;
+            imu.injectCallbackSamples(testCase.samples(20,0,0,0)); monitor.poll();
+            summary=monitor.getStats();
+            testCase.verifyFalse(monitor.IsRunning);
+            testCase.verifyEqual(summary.samplesProcessed,20);
+            testCase.verifyEqual(summary.unrecordedSamplesAfterRecorderFailure,20);
+            testCase.verifyEqual(summary.stopReason,"recorder_failure");
+            testCase.verifyTrue(any(contains(summary.errors,"RecorderAppendFailure")));
+        end
+        function getStatsAfterStopReturnsExactSummary(testCase)
+            [monitor,imu,cleanup]=testCase.monitor(RealtimeDependencyProbe()); %#ok<ASGLU>
+            monitor.startManual(); imu.injectCallbackSamples(testCase.samples(4,0,0,0));
+            summary=monitor.stop(); stats=monitor.getStats();
+            testCase.verifyEqual(stats,summary);
+        end
+        function diskGuardStopsRecordingSafely(testCase)
+            probe=RealtimeDependencyProbe(); probe.FreeDiskBytes=0;
+            [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableRecording',true)); %#ok<ASGLU>
+            monitor.startManual(); summary=monitor.getStats();
+            testCase.verifyFalse(monitor.IsRunning);
+            testCase.verifyEqual(summary.stopReason,"minimum_free_disk");
+            testCase.verifyEqual(summary.recording.status,"incomplete");
+            testCase.verifyEqual(imu.StreamOwner,"none");
+            testCase.verifyTrue(any(contains(summary.warnings,"MINIMUM_FREE_DISK")));
+        end
+        function durationGuardStopsRecordingSafely(testCase)
+            probe=RealtimeDependencyProbe(); probe.ClockElapsed=1;
+            [monitor,~,cleanup]=testCase.monitor(probe,struct('enableRecording',true, ...
+                'maximumRecordingDurationSeconds',0.5)); %#ok<ASGLU>
+            monitor.startManual(); summary=monitor.getStats();
+            testCase.verifyFalse(monitor.IsRunning);
+            testCase.verifyEqual(summary.stopReason,"maximum_recording_duration");
+            testCase.verifyEqual(summary.recording.status,"incomplete");
+        end
+        function sessionSizeGuardStopsAfterCompleteDrainedBatch(testCase)
+            probe=RealtimeDependencyProbe();
+            [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableRecording',true, ...
+                'maximumSessionBytes',10)); %#ok<ASGLU>
+            monitor.startManual(); imu.injectCallbackSamples(testCase.samples(20,0,0,0)); monitor.poll();
+            summary=monitor.getStats();
+            testCase.verifyFalse(monitor.IsRunning);
+            testCase.verifyEqual(summary.stopReason,"maximum_session_bytes");
+            testCase.verifyEqual(summary.samplesProcessed,20);
+            testCase.verifyEqual(summary.recording.samplesWritten,20);
+            testCase.verifyEqual(summary.recording.status,"incomplete");
         end
         function stopDrainsTailIntoRecorderAndFinalStats(testCase)
             probe=RealtimeDependencyProbe();

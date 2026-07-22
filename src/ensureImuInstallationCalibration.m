@@ -19,9 +19,30 @@ result = emptyResult();
 result.calibrationFile = string(filename);
 try
     result.calibration = loadImuCalibration(filename, busId, uid);
+    metadata=result.calibration.metadata;
+    verified=isfield(metadata,'workflowVersion') && ...
+        strlength(string(metadata.workflowVersion))>0 && ...
+        isfield(metadata,'verificationPerformed') && ...
+        islogical(metadata.verificationPerformed) && isscalar(metadata.verificationPerformed) && ...
+        metadata.verificationPerformed && ...
+        isfield(metadata,'verificationPassed') && ...
+        islogical(metadata.verificationPassed) && isscalar(metadata.verificationPassed) && ...
+        metadata.verificationPassed;
+    if ~verified && ~options.AllowUnverifiedLegacyCalibration
+        error('IMU:UnverifiedInstallationCalibration', ...
+            'Installation calibration lacks verified workflow provenance.');
+    end
+    if ~verified
+        result.warnings(end+1,1)= ...
+            "Unverified legacy calibration accepted by explicit migration option.";
+    end
     result.success = true;
     result.calibrationRequired = false;
-    result.message = "Existing installation calibration is valid.";
+    if verified
+        result.message = "Existing verified installation calibration is valid.";
+    else
+        result.message = "Legacy installation calibration accepted for migration.";
+    end
 catch exception
     result.errors(end+1,1) = string(exception.message);
     result.message = "Installation calibration is required. Run examples/run_interactive_imu_installation_calibration.m.";

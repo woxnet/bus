@@ -15,10 +15,36 @@ classdef TestImuInstallationCalibrationPersistence < matlab.unittest.TestCase
         end
         function ensureLoadsValidFile(testCase)
             folder=testCase.tempFolder(); options=getImuInstallationCalibrationWorkflowConfig();
-            options.calibrationDirectory=string(folder); calibration=createTestImuCalibration(false); %#ok<NASGU>
+            options.calibrationDirectory=string(folder); calibration=createTestImuCalibration(false);
+            calibration.metadata.workflowVersion="1.0";
+            calibration.metadata.verificationPerformed=true;
+            calibration.metadata.verificationPassed=true; %#ok<NASGU>
             filename=fullfile(folder,char(getImuConfig().busId+"_imu_mount.mat")); save(filename,'calibration');
             result=ensureImuInstallationCalibration(MockImuBrick2(),getImuConfig().busId,options);
             testCase.verifyTrue(result.success); testCase.verifyFalse(result.calibrationRequired);
+        end
+        function ensureRejectsUnverifiedLegacyByDefault(testCase)
+            folder=testCase.tempFolder(); options=getImuInstallationCalibrationWorkflowConfig();
+            options.calibrationDirectory=string(folder); calibration=createTestImuCalibration(false); %#ok<NASGU>
+            filename=fullfile(folder,char(getImuConfig().busId+"_imu_mount.mat")); save(filename,'calibration');
+            result=ensureImuInstallationCalibration(MockImuBrick2(),getImuConfig().busId,options);
+            testCase.verifyFalse(result.success); testCase.verifyTrue(result.calibrationRequired);
+            testCase.verifyTrue(any(contains(result.errors,"verified workflow provenance")));
+        end
+        function explicitLegacyMigrationOptionIsRequired(testCase)
+            folder=testCase.tempFolder(); options=getImuInstallationCalibrationWorkflowConfig();
+            options.calibrationDirectory=string(folder); options.AllowUnverifiedLegacyCalibration=true;
+            calibration=createTestImuCalibration(false); %#ok<NASGU>
+            filename=fullfile(folder,char(getImuConfig().busId+"_imu_mount.mat")); save(filename,'calibration');
+            result=ensureImuInstallationCalibration(MockImuBrick2(),getImuConfig().busId,options);
+            testCase.verifyTrue(result.success); testCase.verifyNotEmpty(result.warnings);
+        end
+        function legacyScriptDelegatesToControllerWorkflow(testCase)
+            root=fileparts(fileparts(mfilename('fullpath')));
+            source=strtrim(string(fileread(fullfile(root,'examples', ...
+                'run_imu_installation_calibration.m'))));
+            testCase.verifyEqual(source, ...
+                "run(""examples/run_interactive_imu_installation_calibration.m"");");
         end
         function finalFileIsReloadedAndVerified(testCase)
             [controller,probe]=testCase.controller(testCase.tempFolder(),"none",false,false);
@@ -63,6 +89,34 @@ classdef TestImuInstallationCalibrationPersistence < matlab.unittest.TestCase
             testCase.verifyTrue(isfile(result.backupFile)); testCase.verifyTrue(isfile(result.workingFile));
             testCase.verifyTrue(any(result.errorIdentifiers=="Test:RollbackCopyFailure"));
             testCase.verifyGreaterThanOrEqual(numel(result.errors),2); delete(controller);
+        end
+        function existingFinalRequiresBackup(testCase)
+            folder=testCase.tempFolder();
+            [controller,~,marker]=testCase.controller(folder,"none",true,false);
+            options=getImuInstallationCalibrationWorkflowConfig(); %#ok<NASGU>
+            % Rebuild with backup explicitly disabled.
+            delete(controller);
+            samples=[MockImuBrick2.createStationarySequence(1); ...
+                MockImuBrick2.createForwardAccelerationSequence(1,eye(3),1)];
+            imu=MockImuBrick2(samples); workflow=getImuInstallationCalibrationWorkflowConfig();
+            workflow.calibrationDirectory=string(folder); workflow.enableDashboard=false;
+            workflow.backupExistingCalibration=false;
+            workflow.verificationStationarySeconds=.02; workflow.verificationForwardSeconds=.02;
+            probe=CalibrationPersistenceProbe();
+            dependencies=struct('runPreflight',@(~)testCase.preflight(), ...
+                'createCalibrator',@(~,~)FakeInstallationCalibrator(), ...
+                'createDashboard',@(~)[],'confirm',@(~)true, ...
+                'nowUtc',@()datetime('now','TimeZone','UTC'), ...
+                'createTimer',@(varargin)FakeRealtimeTimer(false,varargin{:}), ...
+                'copyFile',@(source,destination)probe.copyFile(source,destination), ...
+                'moveFile',@(source,destination)probe.moveFile(source,destination), ...
+                'deleteFile',@delete,'loadCalibration',@loadImuCalibration,'sleep',@(~)[]);
+            controller=ImuInstallationCalibrationController(imu,getImuConfig().busId,folder,workflow,dependencies);
+            result=controller.runBlocking();
+            testCase.verifyFalse(result.success);
+            testCase.verifyEqual(result.errorIdentifier,"IMU:CalibrationBackupRequired");
+            old=load(result.finalFile,'calibration');
+            testCase.verifyEqual(old.calibration.metadata.previousMarker,marker); delete(controller);
         end
     end
     methods (Access=private)

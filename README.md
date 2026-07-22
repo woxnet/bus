@@ -162,6 +162,13 @@ With physical hardware and a prepared vehicle, run the non-CI acceptance:
 run("examples/run_installation_calibration_hardware_acceptance.m");
 ```
 
+To run installation calibration, the standalone IMU acceptance, and the
+real-time monitor acceptance with one combined MAT/JSON summary, use:
+
+```matlab
+run("examples/run_full_imu_hardware_acceptance.m");
+```
+
 ## Offline driving-event analysis
 
 Recorded `ImuSessionRecorder` directories can be analyzed without access to

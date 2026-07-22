@@ -100,12 +100,34 @@ classdef ImuBrick2 < handle
             if obj.IsStreaming
                 error('IMU:StreamAlreadyActive','Cannot change owner of an active stream.');
             end
-            obj.StreamOwner = string(owner);
+            owner = string(owner);
+            if obj.StreamOwner ~= "none" && obj.StreamOwner ~= owner
+                error('IMU:StreamOwnerConflict', ...
+                    'IMU stream is still owned by %s.', obj.StreamOwner);
+            end
+            obj.StreamOwner = owner;
+        end
+
+        function releaseStreamOwner(obj, expectedOwner)
+            %RELEASESTREAMOWNER Release a quiesced stream after consumer cleanup.
+            validateattributes(expectedOwner, {'char','string'}, {'scalartext'});
+            expectedOwner = string(expectedOwner);
+            if obj.IsStreaming
+                error('IMU:StreamStillActive','Quiesce the stream before releasing its owner.');
+            end
+            if obj.StreamOwner ~= expectedOwner
+                error('IMU:StreamOwnerMismatch', ...
+                    'Expected stream owner %s, actual owner is %s.', ...
+                    expectedOwner, obj.StreamOwner);
+            end
+            obj.StreamOwner = "none";
         end
 
         function stop(obj)
+            owner = obj.StreamOwner;
             obj.quiesce();
             obj.clearCallbackBuffer();
+            if owner ~= "none", obj.releaseStreamOwner(owner); end
         end
 
         function quiesce(obj)
@@ -114,7 +136,6 @@ classdef ImuBrick2 < handle
                 obj.Device.setAllDataPeriod(int64(0));
             end
             obj.IsStreaming = false;
-            obj.StreamOwner = "none";
         end
 
         function data = readOnce(obj)
@@ -412,6 +433,7 @@ classdef ImuBrick2 < handle
 
             obj.IsConnected = false;
             obj.IsStreaming = false;
+            obj.StreamOwner = "none";
         end
     end
 end
