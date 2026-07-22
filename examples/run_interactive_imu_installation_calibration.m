@@ -1,0 +1,26 @@
+projectRoot = fileparts(fileparts(mfilename("fullpath")));
+run(fullfile(projectRoot, "startup.m"));
+assertImuRuntimeReady();
+config = getImuConfig();
+imu = ImuBrick2(config.uid, config.host, config.port);
+cleanup = onCleanup(@()imu.disconnect());
+options = getImuInstallationCalibrationWorkflowConfig();
+options.busId = config.busId;
+options.calibrationDirectory = config.calibrationDirectory;
+options.enableDashboard = true;
+controller = ImuInstallationCalibrationController(imu, config.busId, ...
+    config.calibrationDirectory, options);
+controllerCleanup = onCleanup(@()delete(controller));
+result = controller.runBlocking();
+disp(result);
+assert(result.success, strjoin(result.errors, " "));
+calibration = result.calibration;
+fprintf('Calibration file: %s\n',result.finalFile);
+fprintf('Backup file: %s\n',result.backupFile);
+fprintf('Quality score: %.3f\n',calibration.quality.score);
+fprintf('Verification score: %.3f\n',result.verification.score);
+fprintf('UID: %s\n',calibration.metadata.imuUid);
+fprintf('Bus ID: %s\n',calibration.metadata.busId);
+disp('Rotation matrix:'); disp(calibration.rotationVehicleFromSensor);
+disp('Biases:'); disp(calibration.bias);
+clear projectRoot;

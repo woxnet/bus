@@ -8,6 +8,8 @@ classdef ImuSessionRecorder < handle
         SamplesWritten = 0
         DuplicateSamples = 0
         MissingSamples = 0
+        BytesWritten = 0
+        EstimatedBufferedBytes = 0
     end
     properties (Access = private)
         Imu
@@ -19,6 +21,8 @@ classdef ImuSessionRecorder < handle
         LastSequence = uint64(0)
         StreamSessionId = uint64(0)
         Gaps = zeros(0, 3)
+        ExternalMode = false
+        TrackedFileBytes = []
     end
 
     methods
@@ -37,17 +41,8 @@ classdef ImuSessionRecorder < handle
 
         function start(obj)
             if obj.IsRecording, error('IMU:RecorderAlreadyStarted', 'Recorder is active.'); end
-            root = resolveProjectPath(obj.Options.directory);
-            if ~isfolder(root), mkdir(root); end
-            stamp = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss_SSS'));
-            uuid = char(javaMethod('randomUUID', 'java.util.UUID'));
-            obj.SessionId = string([stamp, '_', uuid(1:8)]);
-            obj.WorkingDirectory = string(fullfile(root, ...
-                char(obj.SessionId) + ".inprogress"));
-            obj.FinalDirectory = string(fullfile(root, char(obj.SessionId)));
-            mkdir(char(obj.WorkingDirectory));
-            obj.resetState();
-            obj.writeMetadata("incomplete");
+            obj.initializeSession(false);
+            if ismethod(obj.Imu,'claimStreamOwner'), obj.Imu.claimStreamOwner("ImuSessionRecorder"); end
             obj.Imu.start(obj.Options.callbackPeriodMs);
             stats = obj.Imu.getCallbackStats();
             obj.StreamSessionId = uint64(stats.sessionId);
@@ -56,53 +51,62 @@ classdef ImuSessionRecorder < handle
 
         function count = poll(obj)
             if ~obj.IsRecording, error('IMU:RecorderNotStarted', 'Recorder is not active.'); end
+            if obj.ExternalMode
+                error('IMU:RecorderExternalMode', ...
+                    'External recorder never reads the callback FIFO.');
+            end
             samples = obj.Imu.drainCallbackSamples(obj.Options.maxPollSamples);
             count = 0;
             for index = 1:numel(samples)
                 sample = samples{index};
                 if uint64(sample.sessionId) ~= obj.StreamSessionId, continue; end
-                sequence = uint64(sample.sequenceNumber);
-                if obj.LastSequence > 0 && sequence <= obj.LastSequence
-                    obj.DuplicateSamples = obj.DuplicateSamples + 1;
-                    continue;
-                end
-                if obj.LastSequence > 0 && sequence > obj.LastSequence + 1
-                    missing = double(sequence - obj.LastSequence - 1);
-                    obj.MissingSamples = obj.MissingSamples + missing;
-                    obj.Gaps(end+1, :) = [double(obj.LastSequence), ...
-                        double(sequence), missing];
-                end
-                sample.imuUid = string(obj.Calibration.metadata.imuUid);
-                sample.busId = string(obj.Calibration.metadata.busId);
                 vehicle = applyMountCalibration(sample, obj.Calibration, ...
                     'AllowSynthetic', obj.Options.AllowSynthetic);
-                obj.SensorBuffer{end+1, 1} = sample;
-                obj.VehicleBuffer{end+1, 1} = vehicle;
-                obj.LastSequence = sequence;
-                count = count + 1;
-                if numel(obj.SensorBuffer) >= obj.Options.chunkSize
-                    obj.flushChunk();
-                end
+                count = count + double(obj.appendPreparedSample(sample, vehicle));
             end
+        end
+
+        function startExternal(obj)
+            if obj.IsRecording, error('IMU:RecorderAlreadyStarted', 'Recorder is active.'); end
+            obj.initializeSession(true);
+            obj.IsRecording = true;
+        end
+
+        function appended = appendSample(obj, sample, vehicle)
+            if ~obj.IsRecording || ~obj.ExternalMode
+                error('IMU:RecorderNotExternal', 'External recorder is not active.');
+            end
+            appended = obj.appendPreparedSample(sample, vehicle);
+        end
+
+        function session = stopExternal(obj, stats, status, reason)
+            if nargin<3 || isempty(status), status="complete"; end
+            if nargin<4, reason="operator_stop"; end
+            if ~obj.IsRecording || ~obj.ExternalMode
+                error('IMU:RecorderNotExternal', 'External recorder is not active.');
+            end
+            if isprop(obj.Imu, 'IsStreaming') && obj.Imu.IsStreaming
+                error('IMU:RecorderFinalizedWhileStreaming', ...
+                    'Quiesce the IMU before finalizing an external recording.');
+            end
+            obj.flushChunk();
+            session = obj.finalize(stats,string(status),string(reason));
         end
 
         function session = stop(obj)
             if ~obj.IsRecording, error('IMU:RecorderNotStarted', 'Recorder is not active.'); end
+            if obj.ExternalMode
+                error('IMU:RecorderExternalMode', 'Use stopExternal for external recording.');
+            end
             obj.poll();
             obj.flushChunk();
             stats = obj.Imu.getCallbackStats();
             obj.Imu.stop();
-            summary = obj.makeSummary(stats, "complete");
-            obj.writeJson(fullfile(char(obj.WorkingDirectory), 'summary.json'), summary);
-            obj.writeMetadata("complete");
-            [success, message] = movefile(char(obj.WorkingDirectory), ...
-                char(obj.FinalDirectory));
-            if ~success
-                error('IMU:RecorderFinalizeFailed', '%s', message);
-            end
-            obj.IsRecording = false;
-            session = summary;
-            session.directory = obj.FinalDirectory;
+            session = obj.finalize(stats,"complete","operator_stop");
+        end
+
+        function bytes=getSessionBytes(obj)
+            bytes=obj.BytesWritten+obj.EstimatedBufferedBytes;
         end
 
         function delete(obj)
@@ -113,7 +117,7 @@ classdef ImuSessionRecorder < handle
                 obj.writeJson(fullfile(char(obj.WorkingDirectory), ...
                     'summary.json'), obj.makeSummary(stats, "incomplete"));
                 obj.writeMetadata("incomplete");
-                obj.Imu.stop();
+                if ~obj.ExternalMode, obj.Imu.stop(); end
             catch exception
                 warning('IMU:RecorderCleanupFailed', '%s', exception.message);
             end
@@ -122,11 +126,67 @@ classdef ImuSessionRecorder < handle
     end
 
     methods (Access = private)
+        function initializeSession(obj, externalMode)
+            root = resolveProjectPath(obj.Options.directory);
+            if ~isfolder(root), mkdir(root); end
+            stamp = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss_SSS'));
+            uuid = char(javaMethod('randomUUID', 'java.util.UUID'));
+            obj.SessionId = string([stamp, '_', uuid(1:8)]);
+            obj.WorkingDirectory = string(fullfile(root, ...
+                char(obj.SessionId) + ".inprogress"));
+            obj.FinalDirectory = string(fullfile(root, char(obj.SessionId)));
+            mkdir(char(obj.WorkingDirectory));
+            obj.resetState(); obj.ExternalMode = logical(externalMode);
+            obj.writeMetadata("incomplete");
+        end
+
+        function appended = appendPreparedSample(obj, sample, vehicle)
+            sequence = uint64(sample.sequenceNumber);
+            if obj.LastSequence > 0 && sequence <= obj.LastSequence
+                obj.DuplicateSamples = obj.DuplicateSamples + 1;
+                appended = false; return;
+            end
+            if obj.LastSequence > 0 && sequence > obj.LastSequence + 1
+                missing = double(sequence - obj.LastSequence - 1);
+                obj.MissingSamples = obj.MissingSamples + missing;
+                obj.Gaps(end+1, :) = [double(obj.LastSequence), double(sequence), missing];
+            end
+            sample.imuUid = string(obj.Calibration.metadata.imuUid);
+            sample.busId = string(obj.Calibration.metadata.busId);
+            vehicle.imuUid = sample.imuUid; vehicle.busId = sample.busId;
+            obj.SensorBuffer{end+1, 1} = sample;
+            obj.VehicleBuffer{end+1, 1} = vehicle;
+            sensorInfo=whos('sample'); vehicleInfo=whos('vehicle');
+            obj.EstimatedBufferedBytes=obj.EstimatedBufferedBytes+ ...
+                double(sensorInfo.bytes+vehicleInfo.bytes);
+            obj.LastSequence = sequence; appended = true;
+            if numel(obj.SensorBuffer) >= obj.Options.chunkSize, obj.flushChunk(); end
+        end
+
+        function session = finalize(obj, stats, status, reason)
+            summary = obj.makeSummary(stats, status);
+            summary.stopReason=string(reason);
+            obj.writeJson(fullfile(char(obj.WorkingDirectory), 'summary.json'), summary);
+            obj.writeMetadata(status);
+            if status=="complete"
+                [success, message] = movefile(char(obj.WorkingDirectory), ...
+                    char(obj.FinalDirectory));
+                if ~success, error('IMU:RecorderFinalizeFailed', '%s', message); end
+                directory=obj.FinalDirectory;
+            else
+                directory=obj.WorkingDirectory;
+            end
+            obj.IsRecording = false; obj.ExternalMode = false;
+            session = summary; session.directory = directory;
+        end
+
         function resetState(obj)
             obj.SensorBuffer = cell(0, 1); obj.VehicleBuffer = cell(0, 1);
             obj.ChunkIndex = 0; obj.LastSequence = uint64(0);
             obj.SamplesWritten = 0; obj.DuplicateSamples = 0;
             obj.MissingSamples = 0; obj.Gaps = zeros(0, 3);
+            obj.BytesWritten=0; obj.EstimatedBufferedBytes=0;
+            obj.TrackedFileBytes=containers.Map('KeyType','char','ValueType','double');
         end
 
         function flushChunk(obj)
@@ -137,8 +197,10 @@ classdef ImuSessionRecorder < handle
             filename = fullfile(char(obj.WorkingDirectory), ...
                 sprintf('samples_%06d.mat', obj.ChunkIndex));
             save(filename, 'sensorSamples', 'vehicleSamples', '-v7');
+            obj.trackFileSize(filename);
             obj.SamplesWritten = obj.SamplesWritten + numel(obj.SensorBuffer);
             obj.SensorBuffer = cell(0, 1); obj.VehicleBuffer = cell(0, 1);
+            obj.EstimatedBufferedBytes=0;
         end
 
         function metadata = metadata(obj, status)
@@ -175,7 +237,7 @@ classdef ImuSessionRecorder < handle
                 'chunkCount', obj.ChunkIndex);
         end
 
-        function writeJson(~, filename, value)
+        function writeJson(obj, filename, value)
             temporary = [filename, '.tmp'];
             fileId = fopen(temporary, 'w');
             if fileId < 0, error('IMU:RecorderWriteFailed', 'Cannot write %s.', filename); end
@@ -184,13 +246,28 @@ classdef ImuSessionRecorder < handle
             clear cleanup;
             [success, message] = movefile(temporary, filename, 'f');
             if ~success, error('IMU:RecorderWriteFailed', '%s', message); end
+            obj.trackFileSize(filename);
+        end
+
+        function trackFileSize(obj,filename)
+            info=dir(filename);
+            if isempty(info), return; end
+            key=char(filename); previous=0;
+            if isempty(obj.TrackedFileBytes)
+                obj.TrackedFileBytes=containers.Map('KeyType','char','ValueType','double');
+            elseif isKey(obj.TrackedFileBytes,key)
+                previous=obj.TrackedFileBytes(key);
+            end
+            current=double(info(1).bytes);
+            obj.BytesWritten=obj.BytesWritten-previous+current;
+            obj.TrackedFileBytes(key)=current;
         end
 
         function options = mergeOptions(~, custom)
             config = getImuConfig();
             options = struct('directory', 'sessions', 'chunkSize', 1000, ...
                 'maxPollSamples', 256, 'callbackPeriodMs', config.callbackPeriodMs, ...
-                'AllowSynthetic', false);
+                'AllowSynthetic', false,'maximumSessionBytes',20*1024^3);
             if ~isstruct(custom) || ~isscalar(custom)
                 error('IMU:InvalidRecorderOptions', 'options must be a scalar struct.');
             end
@@ -203,6 +280,8 @@ classdef ImuSessionRecorder < handle
             validateattributes(options.chunkSize, {'numeric'}, {'scalar','integer','positive'});
             validateattributes(options.maxPollSamples, {'numeric'}, {'scalar','integer','positive'});
             validateattributes(options.callbackPeriodMs, {'numeric'}, {'scalar','positive'});
+            validateattributes(options.maximumSessionBytes, {'numeric'}, ...
+                {'scalar','real','finite','positive'});
             if ~(islogical(options.AllowSynthetic) && isscalar(options.AllowSynthetic))
                 error('IMU:InvalidRecorderOptions', 'AllowSynthetic must be logical.');
             end

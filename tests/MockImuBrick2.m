@@ -8,6 +8,7 @@ classdef MockImuBrick2 < handle
         Host = "localhost"
         Port = 4223
         StreamingPeriodMs = NaN
+        StreamOwner = "none"
         SynchronousSequence = uint64(0)
         LatestData = []
         CallbackReceivedCount = uint64(0)
@@ -18,6 +19,9 @@ classdef MockImuBrick2 < handle
         CallbackBufferedCount = uint64(0)
         LastCallbackSequence = uint64(0)
         CallbackSessionId = uint64(0)
+        DrainCallCount = 0
+        QuiesceCount = 0
+        ClearCount = 0
     end
     properties
         Samples
@@ -36,6 +40,15 @@ classdef MockImuBrick2 < handle
         InjectedDroppedSamples = 0
         InjectedCoalescedSamples = 0
         InjectedStaleSessionDrops = 0
+        FailStart = false
+        FailQuiesce = false
+        FailClear = false
+        DelayedTailSamples = struct.empty
+        InjectTailAfterEmptyDrainCount = Inf
+        InjectOverflowOnStatsCall = Inf
+        FailDrainAt = Inf
+        TailSampleOnEveryDrain = struct.empty
+        TailDrainDelaySeconds = 0
     end
     properties (Access = private)
         Index = 1
@@ -44,6 +57,8 @@ classdef MockImuBrick2 < handle
         CallbackQueue = cell(0, 1)
         CallbackGeneratedCount = 0
         CallbackBufferCapacity = 256
+        EmptyDrainCount = 0
+        StatsCallCount = 0
     end
 
     methods
@@ -81,16 +96,42 @@ classdef MockImuBrick2 < handle
         end
 
         function start(obj, periodMs)
+            if obj.FailStart, error('MockImu:StartFailure','Injected start failure.'); end
             obj.clearCallbackBuffer();
             obj.IsStreaming = true;
             obj.StreamingPeriodMs = double(periodMs);
             obj.StreamTimer = tic;
             obj.LastCallbackTime = 0;
             obj.CallbackGeneratedCount = 0;
+            if obj.StreamOwner == "none", obj.StreamOwner = "callback"; end
+        end
+        function claimStreamOwner(obj,owner)
+            if obj.IsStreaming, error('IMU:StreamAlreadyActive','Stream is active.'); end
+            owner=string(owner);
+            if obj.StreamOwner~="none" && obj.StreamOwner~=owner
+                error('IMU:StreamOwnerConflict','Stream is owned by %s.',obj.StreamOwner);
+            end
+            obj.StreamOwner=owner;
+        end
+        function releaseStreamOwner(obj,expectedOwner)
+            expectedOwner=string(expectedOwner);
+            if obj.IsStreaming, error('IMU:StreamStillActive','Stream is active.'); end
+            if obj.StreamOwner~=expectedOwner
+                error('IMU:StreamOwnerMismatch','Unexpected stream owner.');
+            end
+            obj.StreamOwner="none";
         end
         function stop(obj)
-            obj.IsStreaming = false;
+            owner=obj.StreamOwner;
+            obj.quiesce();
             obj.clearCallbackBuffer();
+            if owner~="none", obj.releaseStreamOwner(owner); end
+        end
+        function quiesce(obj)
+            obj.updateCallbacks();
+            obj.IsStreaming = false;
+            obj.QuiesceCount = obj.QuiesceCount + 1;
+            if obj.FailQuiesce, error('MockImu:QuiesceFailure','Injected quiesce failure.'); end
         end
         function data = latest(obj)
             if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
@@ -106,12 +147,12 @@ classdef MockImuBrick2 < handle
             data = obj.LatestData;
         end
         function data = nextCallbackSample(obj)
-            if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
             obj.updateCallbacks();
             data = [];
             if ~isempty(obj.CallbackQueue)
                 data = obj.CallbackQueue{1};
                 obj.CallbackQueue(1) = [];
+                obj.CallbackQueue = obj.CallbackQueue(:);
                 obj.CallbackBufferedCount = uint64(numel(obj.CallbackQueue));
                 obj.LatestData = data;
             end
@@ -130,15 +171,67 @@ classdef MockImuBrick2 < handle
             end
         end
         function samples = drainCallbackSamples(obj, maxCount)
+            obj.DrainCallCount = obj.DrainCallCount + 1;
+            if obj.DrainCallCount == obj.FailDrainAt
+                error('MockImu:DrainFailure','Injected drain failure.');
+            end
             if nargin < 2, maxCount = Inf; end
+            if ~obj.IsStreaming && isempty(obj.CallbackQueue) && ...
+                    ~isempty(obj.TailSampleOnEveryDrain)
+                if obj.TailDrainDelaySeconds > 0, pause(obj.TailDrainDelaySeconds); end
+                obj.enqueueTailSamples(obj.TailSampleOnEveryDrain);
+            end
+            if isempty(obj.CallbackQueue) && ~obj.IsStreaming && ...
+                    ~isempty(obj.DelayedTailSamples) && ...
+                    obj.EmptyDrainCount >= obj.InjectTailAfterEmptyDrainCount
+                obj.enqueueDelayedTail();
+            end
             samples = cell(0, 1);
             while numel(samples) < maxCount
                 sample = obj.nextCallbackSample();
                 if isempty(sample), break; end
                 samples{end+1, 1} = sample; %#ok<AGROW>
             end
+            if isempty(samples), obj.EmptyDrainCount=obj.EmptyDrainCount+1;
+            else, obj.EmptyDrainCount=0; end
+        end
+        function injectCallbackSamples(obj, samples, sequences, callbackAgeMs)
+            if ~obj.IsStreaming, error('MockImu:NotStreaming', 'Stream is stopped.'); end
+            if nargin < 3 || isempty(sequences)
+                sequences = double(obj.LastCallbackSequence) + (1:numel(samples));
+            end
+            if nargin < 4, callbackAgeMs = 0; end
+            if isscalar(callbackAgeMs), callbackAgeMs = repmat(callbackAgeMs, numel(samples), 1); end
+            for index = 1:numel(samples)
+                sample = samples(index);
+                sample.source = "callback";
+                sample.sessionId = obj.CallbackSessionId;
+                sample.sequenceNumber = uint64(sequences(index));
+                if ~isfield(sample, 'hostTimestamp')
+                    sample.hostTimestamp = datetime('now', 'TimeZone', 'UTC');
+                end
+                if isempty(sample.hostTimestamp.TimeZone), sample.hostTimestamp.TimeZone = 'UTC'; end
+                sample.timestamp = sample.hostTimestamp;
+                sample.callbackAgeMs = double(callbackAgeMs(index));
+                sample.callbackDroppedTotal = obj.CallbackOverflowDroppedCount;
+                sample.callbackOverflowDroppedTotal = obj.CallbackOverflowDroppedCount;
+                sample.callbackCoalescedTotal = obj.CallbackCoalescedCount;
+                sample.callbackStaleSessionDroppedTotal = obj.CallbackStaleSessionDropCount;
+                if numel(obj.CallbackQueue) == obj.CallbackBufferCapacity
+                    obj.CallbackQueue(1) = [];
+                    obj.CallbackOverflowDroppedCount = obj.CallbackOverflowDroppedCount + uint64(1);
+                    obj.CallbackDroppedCount = obj.CallbackOverflowDroppedCount;
+                end
+                obj.CallbackQueue{end+1,1} = sample;
+                obj.LastCallbackSequence = uint64(sequences(index));
+                obj.CallbackGeneratedCount = obj.CallbackGeneratedCount + 1;
+                obj.CallbackReceivedCount = obj.CallbackReceivedCount + uint64(1);
+            end
+            obj.CallbackBufferedCount = uint64(numel(obj.CallbackQueue));
         end
         function clearCallbackBuffer(obj)
+            obj.ClearCount = obj.ClearCount + 1;
+            if obj.FailClear, error('MockImu:ClearFailure','Injected clear failure.'); end
             obj.CallbackQueue = cell(0, 1);
             obj.CallbackSessionId = obj.CallbackSessionId + uint64(1);
             obj.CallbackGeneratedCount = 0;
@@ -151,9 +244,17 @@ classdef MockImuBrick2 < handle
             obj.CallbackBufferedCount = uint64(0);
             obj.LastCallbackSequence = uint64(0);
             obj.LatestData = [];
+            obj.EmptyDrainCount = 0;
+            obj.StatsCallCount = 0;
         end
         function stats = getCallbackStats(obj)
             obj.updateCallbacks();
+            obj.StatsCallCount = obj.StatsCallCount + 1;
+            if obj.StatsCallCount == obj.InjectOverflowOnStatsCall
+                obj.CallbackOverflowDroppedCount = ...
+                    obj.CallbackOverflowDroppedCount + uint64(1);
+                obj.CallbackDroppedCount = obj.CallbackOverflowDroppedCount;
+            end
             stats = struct('received', obj.CallbackReceivedCount, ...
                 'dropped', obj.CallbackDroppedCount, ...
                 'overflowDropped', obj.CallbackOverflowDroppedCount, ...
@@ -173,11 +274,39 @@ classdef MockImuBrick2 < handle
         function disconnect(obj)
             obj.IsStreaming = false;
             obj.clearCallbackBuffer();
+            obj.StreamOwner = "none";
             obj.DisconnectCount = obj.DisconnectCount + 1;
         end
     end
 
     methods (Access = private)
+        function enqueueDelayedTail(obj)
+            samples=obj.DelayedTailSamples; obj.DelayedTailSamples=struct.empty;
+            obj.enqueueTailSamples(samples);
+        end
+        function enqueueTailSamples(obj,samples)
+            for index=1:numel(samples)
+                sample=samples(index); sample.source="callback";
+                sample.sessionId=obj.CallbackSessionId;
+                obj.LastCallbackSequence=obj.LastCallbackSequence+uint64(1);
+                sample.sequenceNumber=obj.LastCallbackSequence;
+                if ~isfield(sample,'hostTimestamp')
+                    sample.hostTimestamp=datetime('now','TimeZone','UTC');
+                end
+                if isempty(sample.hostTimestamp.TimeZone), sample.hostTimestamp.TimeZone='UTC'; end
+                sample.timestamp=sample.hostTimestamp; sample.callbackAgeMs=0;
+                sample.callbackTimestampNanos=double(obj.LastCallbackSequence)* ...
+                    obj.StreamingPeriodMs*1e6;
+                sample.callbackDroppedTotal=obj.CallbackOverflowDroppedCount;
+                sample.callbackOverflowDroppedTotal=obj.CallbackOverflowDroppedCount;
+                sample.callbackCoalescedTotal=obj.CallbackCoalescedCount;
+                sample.callbackStaleSessionDroppedTotal=obj.CallbackStaleSessionDropCount;
+                obj.CallbackQueue{end+1,1}=sample;
+                obj.CallbackGeneratedCount=obj.CallbackGeneratedCount+1;
+                obj.CallbackReceivedCount=obj.CallbackReceivedCount+uint64(1);
+            end
+            obj.CallbackBufferedCount=uint64(numel(obj.CallbackQueue));
+        end
         function updateCallbacks(obj)
             if ~obj.IsStreaming, return; end
             due = obj.StreamingPeriodMs / 1000 * obj.CallbackPeriodScale;

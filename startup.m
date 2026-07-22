@@ -1,10 +1,10 @@
-projectRoot = fileparts(mfilename('fullpath'));
-jarFile = fullfile(projectRoot, 'lib', 'Tinkerforge.jar');
+imuStartupProjectRoot = fileparts(mfilename('fullpath'));
+imuStartupJarFile = fullfile(imuStartupProjectRoot, 'lib', 'Tinkerforge.jar');
 
-addpath(fullfile(projectRoot, 'src'));
-addpath(fullfile(projectRoot, 'examples'));
+addpath(fullfile(imuStartupProjectRoot, 'src'));
+addpath(fullfile(imuStartupProjectRoot, 'examples'));
 
-imuStartupStatus = loadTinkerforgeBindings(jarFile);
+imuStartupStatus = loadTinkerforgeBindings(imuStartupJarFile);
 
 if imuStartupStatus.available
     fprintf('Tinkerforge bindings готовы.\n');
@@ -13,4 +13,4 @@ elseif imuStartupStatus.restartRequired
         'Restart MATLAB before connecting the IMU.\n']);
 end
 
-clear projectRoot jarFile;
+clear imuStartupProjectRoot imuStartupJarFile;

@@ -9,6 +9,7 @@ classdef ImuBrick2 < handle
         Host
         Port
         StreamingPeriodMs = NaN
+        StreamOwner = "none"
         SynchronousSequence = uint64(0)
         CallbackSessionId = uint64(0)
     end
@@ -90,14 +91,51 @@ classdef ImuBrick2 < handle
             obj.Device.setAllDataPeriod(int64(periodMs));
             obj.IsStreaming = true;
             obj.StreamingPeriodMs = double(periodMs);
+            if obj.StreamOwner == "none", obj.StreamOwner = "callback"; end
+        end
+
+        function claimStreamOwner(obj, owner)
+            %CLAIMSTREAMOWNER Mark the component that will own callback reads.
+            validateattributes(owner, {'char','string'}, {'scalartext'});
+            if obj.IsStreaming
+                error('IMU:StreamAlreadyActive','Cannot change owner of an active stream.');
+            end
+            owner = string(owner);
+            if obj.StreamOwner ~= "none" && obj.StreamOwner ~= owner
+                error('IMU:StreamOwnerConflict', ...
+                    'IMU stream is still owned by %s.', obj.StreamOwner);
+            end
+            obj.StreamOwner = owner;
+        end
+
+        function releaseStreamOwner(obj, expectedOwner)
+            %RELEASESTREAMOWNER Release a quiesced stream after consumer cleanup.
+            validateattributes(expectedOwner, {'char','string'}, {'scalartext'});
+            expectedOwner = string(expectedOwner);
+            if obj.IsStreaming
+                error('IMU:StreamStillActive','Quiesce the stream before releasing its owner.');
+            end
+            if obj.StreamOwner ~= expectedOwner
+                error('IMU:StreamOwnerMismatch', ...
+                    'Expected stream owner %s, actual owner is %s.', ...
+                    expectedOwner, obj.StreamOwner);
+            end
+            obj.StreamOwner = "none";
         end
 
         function stop(obj)
+            owner = obj.StreamOwner;
+            obj.quiesce();
+            obj.clearCallbackBuffer();
+            if owner ~= "none", obj.releaseStreamOwner(owner); end
+        end
+
+        function quiesce(obj)
+            %QUIESCE Stop callback generation while preserving queued data.
             if obj.IsConnected
                 obj.Device.setAllDataPeriod(int64(0));
-                obj.IsStreaming = false;
-                obj.clearCallbackBuffer();
             end
+            obj.IsStreaming = false;
         end
 
         function data = readOnce(obj)
@@ -395,6 +433,7 @@ classdef ImuBrick2 < handle
 
             obj.IsConnected = false;
             obj.IsStreaming = false;
+            obj.StreamOwner = "none";
         end
     end
 end
