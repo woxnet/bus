@@ -13,7 +13,8 @@ classdef TestBusImuAcceptanceSummary < matlab.unittest.TestCase
             summary=summarizeBusImuAcceptance(calibrationReport,runtimeReport,realtimeReport);
             testCase.verifyTrue(summary.success);
             fields={'commitMatch','uidMatch','busIdMatch','sensorFusionModeMatch', ...
-                'calibrationFileExists','calibrationVerified','runtimeSuccess','realtimeSuccess'};
+                'calibrationFileExists','calibrationVerified','runtimeSuccess','realtimeSuccess', ...
+                'runtimeTailComplete','runtimeBufferEmpty'};
             for index=1:numel(fields), testCase.verifyTrue(summary.(fields{index})); end
             jsonFile=[tempname '.json']; testCase.addTeardown(@()deleteIfFile(jsonFile));
             fileId=fopen(jsonFile,'w'); testCase.assertGreaterThanOrEqual(fileId,0);
@@ -46,6 +47,25 @@ classdef TestBusImuAcceptanceSummary < matlab.unittest.TestCase
             testCase.verifyFalse(summary.runtimeSuccess);
             testCase.verifyFalse(summary.realtimeSuccess);
         end
+        function incompleteRuntimeTailIsRejected(testCase)
+            calibrationFile=[tempname '.mat']; calibration=1; %#ok<NASGU>
+            save(calibrationFile,'calibration'); testCase.addTeardown(@()deleteIfFile(calibrationFile));
+            [calibrationReport,runtimeReport,realtimeReport]=testCase.reports(calibrationFile);
+            runtimeReport.samplesReadMatchesReceived=false;
+            summary=summarizeBusImuAcceptance(calibrationReport,runtimeReport,realtimeReport);
+            testCase.verifyFalse(summary.success);
+            testCase.verifyFalse(summary.runtimeTailComplete);
+            runtimeReport.samplesReadMatchesReceived=true;
+            runtimeReport.stopDrainTimedOut=true;
+            summary=summarizeBusImuAcceptance(calibrationReport,runtimeReport,realtimeReport);
+            testCase.verifyFalse(summary.runtimeTailComplete);
+            runtimeReport.stopDrainTimedOut=false; runtimeReport.finalBufferedSamples=1;
+            summary=summarizeBusImuAcceptance(calibrationReport,runtimeReport,realtimeReport);
+            testCase.verifyFalse(summary.runtimeBufferEmpty);
+            runtimeReport=rmfield(runtimeReport,'stopDrainTimedOut');
+            summary=summarizeBusImuAcceptance(calibrationReport,runtimeReport,realtimeReport);
+            testCase.verifyFalse(summary.runtimeTailComplete);
+        end
         function hardwareReportProducersExposeIdentityContract(testCase)
             root=fileparts(fileparts(mfilename('fullpath')));
             files={fullfile(root,'examples','run_installation_calibration_hardware_acceptance.m'), ...
@@ -64,7 +84,11 @@ classdef TestBusImuAcceptanceSummary < matlab.unittest.TestCase
                 'busId',"bus",'firmwareVersion',[2 0 15],'sensorFusionMode',2);
             calibrationReport=common; calibrationReport.calibrationFile=string(calibrationFile);
             calibrationReport.verification=struct('success',true);
-            runtimeReport=common; realtimeReport=common;
+            runtimeReport=common;
+            runtimeReport.samplesReadMatchesReceived=true;
+            runtimeReport.stopDrainTimedOut=false;
+            runtimeReport.finalBufferedSamples=0;
+            realtimeReport=common;
         end
     end
 end

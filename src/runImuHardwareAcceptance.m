@@ -12,7 +12,8 @@ identity=imu.getIdentity(); sensorFusionMode=imu.getSensorFusionMode();
 if gitStatus~=0, commit="unknown"; else, commit=strtrim(string(commit)); end
 
 imu.start(config.callbackPeriodMs);
-cleanup = onCleanup(@()imu.stop());
+streamOwner = string(imu.StreamOwner);
+cleanup = onCleanup(@()cleanupAcceptanceLifecycle(imu, streamOwner));
 sessionStats = imu.getCallbackStats();
 sequences = zeros(0, 1, 'uint64'); nanos = zeros(0, 1);
 ages = zeros(0, 1); quaternionNorms = zeros(0, 1);
@@ -22,8 +23,14 @@ while toc(timer) < durationSeconds
     consume(imu.drainCallbackSamples(256));
     pause(0.001);
 end
-consume(imu.drainCallbackSamples(256));
+imu.quiesce();
+[tailSamplesDrained, stopDrainDurationSeconds, stopDrainTimedOut] = drainTail();
 stats = imu.getCallbackStats();
+finalBufferedSamples = double(stats.buffered);
+imu.clearCallbackBuffer();
+imu.releaseStreamOwner(streamOwner);
+streamOwnerReleased = string(imu.StreamOwner) == "none";
+streamStopped = ~imu.IsStreaming;
 
 intervals = diff(nanos) / 1e9;
 frequencies = 1 ./ intervals(intervals > 0);
@@ -36,6 +43,13 @@ report = struct('success', false, 'generatedAt', string(datetime( ...
     'sensorFusionMode',double(sensorFusionMode), ...
     'sessionId', stats.sessionId, 'samplesRead', numel(sequences), ...
     'received', double(stats.received), 'missing', missing, ...
+    'tailSamplesDrained', double(tailSamplesDrained), ...
+    'stopDrainDurationSeconds', double(stopDrainDurationSeconds), ...
+    'stopDrainTimedOut', logical(stopDrainTimedOut), ...
+    'finalBufferedSamples', finalBufferedSamples, ...
+    'samplesReadMatchesReceived', numel(sequences) == double(stats.received), ...
+    'streamOwnerReleased', streamOwnerReleased, ...
+    'streamStopped', streamStopped, 'finalCallbackStats', stats, ...
     'overflowDropped', double(stats.overflowDropped), ...
     'coalesced', double(stats.coalesced), ...
     'staleSessionDropped', double(stats.staleSessionDropped), ...
@@ -59,7 +73,10 @@ report.success = report.samplesRead >= floor(durationSeconds * ...
     report.sampleAgeMaximumMs <= config.maximumCallbackSampleAgeMs && ...
     abs(report.quaternionNormMean - 1) <= 0.1 && ...
     abs(report.gravityMagnitudeMean - config.gravityReference) <= ...
-        config.maximumGravityError;
+        config.maximumGravityError && ~report.stopDrainTimedOut && ...
+    report.finalBufferedSamples == 0 && report.samplesReadMatchesReceived && ...
+    report.samplesRead == report.received && report.streamOwnerReleased && ...
+    report.streamStopped;
 
 stamp = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
 base = fullfile(outputDirectory, ['hardware_acceptance_', stamp]);
@@ -68,6 +85,31 @@ report.jsonFile = string(base) + ".json";
 save(char(report.matFile), 'report');
 writeJson(char(report.jsonFile), report);
 clear cleanup;
+
+    function [count, duration, timedOut] = drainTail()
+        stopDrainTimeoutSeconds = 0.5;
+        stopDrainEmptyPasses = 3;
+        stopDrainPollIntervalSeconds = 0.005;
+        count = 0;
+        emptyPasses = 0;
+        drainTimer = tic;
+        while emptyPasses < stopDrainEmptyPasses
+            if toc(drainTimer) >= stopDrainTimeoutSeconds, break; end
+            samples = imu.drainCallbackSamples(256);
+            if isempty(samples)
+                emptyPasses = emptyPasses + 1;
+                if emptyPasses < stopDrainEmptyPasses
+                    pause(stopDrainPollIntervalSeconds);
+                end
+            else
+                emptyPasses = 0;
+                consume(samples);
+                count = count + numel(samples);
+            end
+        end
+        duration = toc(drainTimer);
+        timedOut = emptyPasses < stopDrainEmptyPasses;
+    end
 
     function consume(samples)
         for sampleIndex = 1:numel(samples)
@@ -81,6 +123,31 @@ clear cleanup;
             temperatures(end+1, 1) = double(sample.temperature); %#ok<AGROW>
         end
     end
+end
+
+function cleanupAcceptanceLifecycle(imu, streamOwner)
+if ~imu.IsStreaming && string(imu.StreamOwner) == "none", return; end
+try
+    imu.quiesce();
+catch exception
+    warning('IMU:AcceptanceCleanupFailed', ...
+        'Failed to quiesce IMU during acceptance cleanup: %s', exception.message);
+end
+try
+    imu.clearCallbackBuffer();
+catch exception
+    warning('IMU:AcceptanceCleanupFailed', ...
+        'Failed to clear callback FIFO during acceptance cleanup: %s', exception.message);
+end
+if string(imu.StreamOwner) ~= "none"
+    try
+        imu.releaseStreamOwner(streamOwner);
+    catch exception
+        warning('IMU:AcceptanceCleanupFailed', ...
+            'Failed to release stream owner during acceptance cleanup: %s', ...
+            exception.message);
+    end
+end
 end
 
 function value = safeStatistic(values, operation)

@@ -46,6 +46,9 @@ classdef MockImuBrick2 < handle
         DelayedTailSamples = struct.empty
         InjectTailAfterEmptyDrainCount = Inf
         InjectOverflowOnStatsCall = Inf
+        FailDrainAt = Inf
+        TailSampleOnEveryDrain = struct.empty
+        TailDrainDelaySeconds = 0
     end
     properties (Access = private)
         Index = 1
@@ -169,7 +172,15 @@ classdef MockImuBrick2 < handle
         end
         function samples = drainCallbackSamples(obj, maxCount)
             obj.DrainCallCount = obj.DrainCallCount + 1;
+            if obj.DrainCallCount == obj.FailDrainAt
+                error('MockImu:DrainFailure','Injected drain failure.');
+            end
             if nargin < 2, maxCount = Inf; end
+            if ~obj.IsStreaming && isempty(obj.CallbackQueue) && ...
+                    ~isempty(obj.TailSampleOnEveryDrain)
+                if obj.TailDrainDelaySeconds > 0, pause(obj.TailDrainDelaySeconds); end
+                obj.enqueueTailSamples(obj.TailSampleOnEveryDrain);
+            end
             if isempty(obj.CallbackQueue) && ~obj.IsStreaming && ...
                     ~isempty(obj.DelayedTailSamples) && ...
                     obj.EmptyDrainCount >= obj.InjectTailAfterEmptyDrainCount
@@ -271,6 +282,9 @@ classdef MockImuBrick2 < handle
     methods (Access = private)
         function enqueueDelayedTail(obj)
             samples=obj.DelayedTailSamples; obj.DelayedTailSamples=struct.empty;
+            obj.enqueueTailSamples(samples);
+        end
+        function enqueueTailSamples(obj,samples)
             for index=1:numel(samples)
                 sample=samples(index); sample.source="callback";
                 sample.sessionId=obj.CallbackSessionId;
@@ -281,6 +295,8 @@ classdef MockImuBrick2 < handle
                 end
                 if isempty(sample.hostTimestamp.TimeZone), sample.hostTimestamp.TimeZone='UTC'; end
                 sample.timestamp=sample.hostTimestamp; sample.callbackAgeMs=0;
+                sample.callbackTimestampNanos=double(obj.LastCallbackSequence)* ...
+                    obj.StreamingPeriodMs*1e6;
                 sample.callbackDroppedTotal=obj.CallbackOverflowDroppedCount;
                 sample.callbackOverflowDroppedTotal=obj.CallbackOverflowDroppedCount;
                 sample.callbackCoalescedTotal=obj.CallbackCoalescedCount;
