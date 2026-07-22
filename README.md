@@ -122,10 +122,39 @@ Only after successful hardware diagnostics, place the stationary bus on a
 level surface and run calibration explicitly:
 
 ```matlab
-run("examples/run_imu_installation_calibration.m");
+run("examples/run_interactive_imu_installation_calibration.m");
 ```
 
-Calibration is never started by `startup.m`.
+The workflow explicitly performs hardware preflight, two operator-confirmed
+manoeuvres, quality validation, an independent verification pass, a verified
+working-file reload, and atomic activation. Calibration is never started by
+`startup.m`, `ImuBrick2`, `RealtimeDrivingMonitor`, or because a file is
+missing. A running callback stream must be stopped explicitly before starting.
+
+The candidate is first written as
+`calibration/<bus-id>_imu_mount.inprogress.mat`. A valid existing final file
+remains active until the candidate passes verification. Successful replacement
+copies the previous file to `calibration/archive/` with a UTC timestamp. Failed
+and cancelled workflows remove the working file by default and preserve the
+old final calibration.
+
+Recalibration is mandatory after moving or replacing the IMU, loosening its
+mount, changing enclosure orientation, repairing the mounting surface, or a
+material degradation of verification metrics.
+
+Verification checks level stationary gravity, stationary linear acceleration
+and angular rate, then a separate smooth straight-forward acceleration. It
+only applies the candidate transform and never recalculates the rotation.
+Because this is IMU-only, the operator must perform an actual forward
+acceleration rather than backward braking; without CAN or GNSS the system
+cannot independently prove the direction of travel. A negative longitudinal
+verification result is rejected rather than silently flipping the matrix.
+
+With physical hardware and a prepared vehicle, run the non-CI acceptance:
+
+```matlab
+run("examples/run_installation_calibration_hardware_acceptance.m");
+```
 
 ## Offline driving-event analysis
 

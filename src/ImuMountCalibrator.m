@@ -19,6 +19,12 @@ classdef ImuMountCalibrator < handle
         Config
     end
 
+    properties
+        OnStatusChanged = []
+        OnProgress = []
+        OnMessage = []
+    end
+
     properties (Access = private)
         Imu
         CancelRequested = false
@@ -151,10 +157,10 @@ classdef ImuMountCalibrator < handle
                     measurement = obj.measurement(data);
                     measurement.monotonicSeconds = toc(obj.PacingTimer);
                     samples(end+1, 1) = measurement; %#ok<AGROW>
-                    obj.Progress = min(0.40, 0.05 + 0.35 * numel(samples) / needed);
+                    obj.updateProgress(min(0.40, 0.05 + 0.35 * numel(samples) / needed));
                 else
                     samples = repmat(obj.emptyMeasurement(), 0, 1);
-                    obj.Progress = 0.05;
+                    obj.updateProgress(0.05);
                 end
                 obj.samplePause();
             end
@@ -202,21 +208,21 @@ classdef ImuMountCalibrator < handle
                     samples = zeros(0, 3);
                     sampleTimes = zeros(0, 1);
                     gapSamples = 0;
-                    obj.Progress = 0.50;
+                    obj.updateProgress(0.50);
                     obj.LastMessage = "Обнаружен поворот, сегмент разгона сброшен";
                     fprintf('%s\n', char(obj.LastMessage));
                 elseif validMagnitude && consistent
                     samples(end+1, :) = horizontal.'; %#ok<AGROW>
                     sampleTimes(end+1, 1) = toc(obj.PacingTimer); %#ok<AGROW>
                     gapSamples = 0;
-                    obj.Progress = min(0.88, 0.50 + 0.38 * size(samples, 1) / needed);
+                    obj.updateProgress(min(0.88, 0.50 + 0.38 * size(samples, 1) / needed));
                 elseif ~isempty(samples) && gapSamples < maxGap
                     gapSamples = gapSamples + 1;
                 else
                     samples = zeros(0, 3);
                     sampleTimes = zeros(0, 1);
                     gapSamples = 0;
-                    obj.Progress = 0.50;
+                    obj.updateProgress(0.50);
                 end
                 obj.samplePause();
             end
@@ -449,6 +455,28 @@ classdef ImuMountCalibrator < handle
             obj.Progress = max(0, min(1, progress));
             obj.LastMessage = message;
             fprintf('%s\n', char(message));
+            status = struct('state', obj.State, 'progress', obj.Progress, ...
+                'message', obj.LastMessage);
+            obj.invokeCallback(obj.OnStatusChanged, status);
+            obj.invokeCallback(obj.OnProgress, status);
+            obj.invokeCallback(obj.OnMessage, status);
+        end
+
+        function updateProgress(obj, progress)
+            obj.Progress = max(0, min(1, progress));
+            status = struct('state', obj.State, 'progress', obj.Progress, ...
+                'message', obj.LastMessage);
+            obj.invokeCallback(obj.OnProgress, status);
+        end
+
+        function invokeCallback(obj, callback, value)
+            if isempty(callback), return; end
+            try
+                callback(obj, value);
+            catch exception
+                warning('IMU:CalibrationCallbackFailed', ...
+                    'Calibration callback failed: %s', exception.message);
+            end
         end
     end
 

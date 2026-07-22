@@ -100,6 +100,7 @@ classdef RealtimeDrivingMonitor < handle
                 obj.validateStartInputs(); obj.reset();
                 clockStart=obj.Dependencies.monotonicClockStart;
                 obj.MonitorClock=clockStart();
+                if ismethod(obj.Imu,'claimStreamOwner'), obj.Imu.claimStreamOwner("RealtimeDrivingMonitor"); end
                 obj.Imu.start(obj.Config.callbackPeriodMs);
                 stats=obj.Imu.getCallbackStats();
                 obj.StreamSessionId=uint64(stats.sessionId);

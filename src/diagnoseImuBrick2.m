@@ -97,7 +97,9 @@ dependencies.pauseFunction(dependencies.fusionSettleDelaySeconds);
 
 wasStreaming = logical(imu.IsStreaming);
 previousPeriod = double(imu.StreamingPeriodMs);
-streamCleanup = onCleanup(@()restoreStream(imu, wasStreaming, previousPeriod));
+previousOwner = "callback";
+if isprop(imu,'StreamOwner'), previousOwner=string(imu.StreamOwner); end
+streamCleanup = onCleanup(@()restoreStream(imu, wasStreaming, previousPeriod,previousOwner));
 if wasStreaming, imu.stop(); end
 
 syncOptions = struct('sampleCount', 20, ...
@@ -296,11 +298,14 @@ valuesFinite = isnumeric(numeric) && all(isfinite(numeric));
 quaternionNorm = norm(sample.quaternion);
 end
 
-function restoreStream(imu, wasStreaming, previousPeriod)
+function restoreStream(imu, wasStreaming, previousPeriod,previousOwner)
 try
     imu.stop();
     imu.clearCallbackBuffer();
-    if wasStreaming, imu.start(previousPeriod); end
+    if wasStreaming
+        if ismethod(imu,'claimStreamOwner'), imu.claimStreamOwner(previousOwner); end
+        imu.start(previousPeriod);
+    end
 catch exception
     warning('IMU:StreamRestoreFailed', 'Не удалось восстановить поток: %s', exception.message);
 end

@@ -2,11 +2,16 @@ projectRoot = fileparts(fileparts(mfilename('fullpath')));
 run(fullfile(projectRoot, "startup.m"));
 assertImuRuntimeReady();
 imuConfig = getImuConfig();
-calibrationFile = resolveProjectPath(fullfile( ...
-    imuConfig.calibrationDirectory, imuConfig.busId + "_imu_mount.mat"));
-calibration = loadImuCalibration(calibrationFile, imuConfig.busId, imuConfig.uid);
 imu = ImuBrick2(imuConfig.uid, imuConfig.host, imuConfig.port);
 imuCleanup = onCleanup(@()imu.disconnect());
+calibrationStatus = ensureImuInstallationCalibration(imu, imuConfig.busId, ...
+    getImuInstallationCalibrationWorkflowConfig());
+if calibrationStatus.calibrationRequired
+    error('IMU:InstallationCalibrationRequired', ...
+        ['A valid installation calibration is required. Run: ', ...
+         'run("examples/run_interactive_imu_installation_calibration.m");']);
+end
+calibration = calibrationStatus.calibration;
 preflight = diagnoseImuBrick2UsingExistingConnection(imu);
 disp(preflight); assert(preflight.success);
 options = getRealtimeDrivingConfig();

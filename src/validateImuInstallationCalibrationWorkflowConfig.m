@@ -1,0 +1,57 @@
+function config = validateImuInstallationCalibrationWorkflowConfig(config)
+%VALIDATEIMUINSTALLATIONCALIBRATIONWORKFLOWCONFIG Validate workflow options.
+defaults = localDefaults();
+if ~isstruct(config) || ~isscalar(config)
+    error('IMU:InvalidConfiguration', 'Workflow config must be a scalar structure.');
+end
+unknown = setdiff(fieldnames(config), fieldnames(defaults));
+if ~isempty(unknown)
+    error('IMU:InvalidConfiguration', 'Unknown workflow option: %s.', unknown{1});
+end
+names = fieldnames(defaults);
+for index = 1:numel(names)
+    if ~isfield(config, names{index}), config.(names{index}) = defaults.(names{index}); end
+end
+if ~(isText(config.busId) && strlength(string(config.busId)) > 0)
+    error('IMU:InvalidConfiguration', 'busId must be nonempty text.');
+end
+if ~(isText(config.calibrationDirectory) && strlength(string(config.calibrationDirectory)) > 0)
+    error('IMU:InvalidConfiguration', 'calibrationDirectory must be nonempty text.');
+end
+logicalFields = {'requireOperatorConfirmation','StopExistingStream', ...
+    'RestorePreviousStream','enableDashboard','performVerification', ...
+    'backupExistingCalibration','keepFailedWorkingFiles'};
+for index = 1:numel(logicalFields)
+    value = config.(logicalFields{index});
+    if ~(islogical(value) && isscalar(value))
+        error('IMU:InvalidConfiguration', '%s must be a logical scalar.', logicalFields{index});
+    end
+end
+positiveFields = {'pollStatusSeconds','verificationStationarySeconds', ...
+    'verificationForwardSeconds','maximumVerificationGravityError', ...
+    'maximumVerificationLateralGravity','maximumVerificationLongitudinalGravity', ...
+    'minimumVerificationForwardAcceleration', ...
+    'maximumVerificationYawRateDegPerSecond'};
+for index = 1:numel(positiveFields)
+    validateattributes(config.(positiveFields{index}), {'numeric'}, ...
+        {'real','finite','scalar','positive'}, mfilename, positiveFields{index});
+end
+end
+
+function defaults = localDefaults()
+imu = getImuConfig();
+defaults = struct('busId',imu.busId,'calibrationDirectory',imu.calibrationDirectory, ...
+    'requireOperatorConfirmation',true,'StopExistingStream',false, ...
+    'RestorePreviousStream',false,'enableDashboard',true,'pollStatusSeconds',0.10, ...
+    'performVerification',true,'verificationStationarySeconds',3.0, ...
+    'verificationForwardSeconds',1.0,'maximumVerificationGravityError',0.50, ...
+    'maximumVerificationLateralGravity',0.35, ...
+    'maximumVerificationLongitudinalGravity',0.35, ...
+    'minimumVerificationForwardAcceleration',0.25, ...
+    'maximumVerificationYawRateDegPerSecond',6.0, ...
+    'backupExistingCalibration',true,'keepFailedWorkingFiles',false);
+end
+
+function result = isText(value)
+result = (ischar(value) && isrow(value)) || (isstring(value) && isscalar(value));
+end

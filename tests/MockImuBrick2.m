@@ -8,6 +8,7 @@ classdef MockImuBrick2 < handle
         Host = "localhost"
         Port = 4223
         StreamingPeriodMs = NaN
+        StreamOwner = "none"
         SynchronousSequence = uint64(0)
         LatestData = []
         CallbackReceivedCount = uint64(0)
@@ -99,6 +100,11 @@ classdef MockImuBrick2 < handle
             obj.StreamTimer = tic;
             obj.LastCallbackTime = 0;
             obj.CallbackGeneratedCount = 0;
+            if obj.StreamOwner == "none", obj.StreamOwner = "callback"; end
+        end
+        function claimStreamOwner(obj,owner)
+            if obj.IsStreaming, error('IMU:StreamAlreadyActive','Stream is active.'); end
+            obj.StreamOwner=string(owner);
         end
         function stop(obj)
             obj.quiesce();
@@ -107,6 +113,7 @@ classdef MockImuBrick2 < handle
         function quiesce(obj)
             obj.updateCallbacks();
             obj.IsStreaming = false;
+            obj.StreamOwner = "none";
             obj.QuiesceCount = obj.QuiesceCount + 1;
             if obj.FailQuiesce, error('MockImu:QuiesceFailure','Injected quiesce failure.'); end
         end

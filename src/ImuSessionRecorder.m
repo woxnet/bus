@@ -39,6 +39,7 @@ classdef ImuSessionRecorder < handle
         function start(obj)
             if obj.IsRecording, error('IMU:RecorderAlreadyStarted', 'Recorder is active.'); end
             obj.initializeSession(false);
+            if ismethod(obj.Imu,'claimStreamOwner'), obj.Imu.claimStreamOwner("ImuSessionRecorder"); end
             obj.Imu.start(obj.Options.callbackPeriodMs);
             stats = obj.Imu.getCallbackStats();
             obj.StreamSessionId = uint64(stats.sessionId);

@@ -9,6 +9,7 @@ classdef ImuBrick2 < handle
         Host
         Port
         StreamingPeriodMs = NaN
+        StreamOwner = "none"
         SynchronousSequence = uint64(0)
         CallbackSessionId = uint64(0)
     end
@@ -90,6 +91,16 @@ classdef ImuBrick2 < handle
             obj.Device.setAllDataPeriod(int64(periodMs));
             obj.IsStreaming = true;
             obj.StreamingPeriodMs = double(periodMs);
+            if obj.StreamOwner == "none", obj.StreamOwner = "callback"; end
+        end
+
+        function claimStreamOwner(obj, owner)
+            %CLAIMSTREAMOWNER Mark the component that will own callback reads.
+            validateattributes(owner, {'char','string'}, {'scalartext'});
+            if obj.IsStreaming
+                error('IMU:StreamAlreadyActive','Cannot change owner of an active stream.');
+            end
+            obj.StreamOwner = string(owner);
         end
 
         function stop(obj)
@@ -103,6 +114,7 @@ classdef ImuBrick2 < handle
                 obj.Device.setAllDataPeriod(int64(0));
             end
             obj.IsStreaming = false;
+            obj.StreamOwner = "none";
         end
 
         function data = readOnce(obj)
