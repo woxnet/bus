@@ -16,6 +16,10 @@ classdef ImuInstallationCalibrationController < handle
         StartedAt = NaT
         CompletedAt = NaT
         LastError = []
+        ActivationAttempted = false
+        ActivationVerified = false
+        RollbackAttempted = false
+        RollbackSucceeded = false
     end
     properties
         OnStateChanged = []
@@ -39,6 +43,17 @@ classdef ImuInstallationCalibrationController < handle
         PreviousStreamingPeriodMs = NaN
         OperatorConfirmedStationary = false
         OperatorConfirmedForward = false
+        OperatorConfirmedVerificationForward = false
+        CalibrationForwardDecisionHandled = false
+        SamplesRequired = 0
+        SamplesCollected = 0
+        Phase = "idle"
+        ConfirmationPending = false
+        ConfirmationDecision = NaN
+        ErrorIdentifiers = strings(0,1)
+        ErrorMessages = strings(0,1)
+        PreserveDiagnostics = false
+        DependenciesInjected = false
         Deleting = false
     end
 
@@ -55,6 +70,7 @@ classdef ImuInstallationCalibrationController < handle
             options.calibrationDirectory = string(calibrationDirectory);
             obj.Options = validateImuInstallationCalibrationWorkflowConfig(options);
             if nargin < 5, dependencies = struct(); end
+            obj.DependenciesInjected = ~isempty(fieldnames(dependencies));
             obj.Dependencies = obj.mergeDependencies(dependencies);
             obj.Imu = imu;
             obj.BusId = string(busId);
@@ -81,9 +97,22 @@ classdef ImuInstallationCalibrationController < handle
 
         function cancel(obj)
             obj.CancelRequested = true;
+            obj.ConfirmationPending = false;
             if ~isempty(obj.Calibrator)
                 try, obj.Calibrator.cancel(); catch, end
             end
+        end
+
+        function confirmCurrentStep(obj)
+            if ~obj.ConfirmationPending, return; end
+            obj.ConfirmationDecision = true;
+            obj.ConfirmationPending = false;
+        end
+
+        function rejectCurrentStep(obj)
+            if ~obj.ConfirmationPending, return; end
+            obj.ConfirmationDecision = false;
+            obj.ConfirmationPending = false;
         end
 
         function result = wait(obj)
@@ -111,7 +140,11 @@ classdef ImuInstallationCalibrationController < handle
                 'completedAt',obj.CompletedAt,'lastError',obj.LastError, ...
                 'finalFile',obj.FinalFile,'backupFile',obj.BackupFile, ...
                 'workingFile',obj.WorkingFile,'quality',obj.qualityScore(), ...
-                'verification',obj.verificationScore());
+                'verification',obj.verificationScore(), ...
+                'samplesRequired',obj.SamplesRequired, ...
+                'samplesCollected',obj.SamplesCollected, ...
+                'samplesRemaining',max(0,obj.SamplesRequired-obj.SamplesCollected), ...
+                'phase',obj.Phase);
         end
 
         function delete(obj)
@@ -119,7 +152,7 @@ classdef ImuInstallationCalibrationController < handle
             obj.Deleting = true;
             obj.cancel();
             obj.destroyTimer();
-            if ~obj.Options.keepFailedWorkingFiles, obj.safeDeleteWorking(); end
+            if ~obj.Options.keepFailedWorkingFiles && ~obj.PreserveDiagnostics, obj.safeDeleteWorking(); end
             if ~isempty(obj.Dashboard)
                 try, delete(obj.Dashboard); catch, end
             end
@@ -133,6 +166,8 @@ classdef ImuInstallationCalibrationController < handle
             obj.StartedAt = obj.Dependencies.nowUtc();
             obj.CompletedAt = NaT;
             obj.LastError = [];
+            obj.ErrorIdentifiers = strings(0,1);
+            obj.ErrorMessages = strings(0,1);
             if obj.Options.enableDashboard
                 obj.Dashboard = obj.Dependencies.createDashboard(obj);
             end
@@ -146,13 +181,12 @@ classdef ImuInstallationCalibrationController < handle
                 obj.PreflightReport = obj.Dependencies.runPreflight(obj.Imu);
                 obj.validatePreflight();
                 obj.checkCancelled();
-                obj.setStatus("OPERATOR_CONFIRMATION",0.03, ...
-                    "Confirm that the bus is stationary, level, closed, and the IMU is secured.");
-                if obj.Options.requireOperatorConfirmation && ...
-                        ~obj.Dependencies.confirm(obj.stationaryPrompt())
+                if ~obj.requestConfirmation(obj.stationaryPrompt(),0.03)
                     obj.cancel(); obj.checkCancelled();
                 end
-                obj.OperatorConfirmedStationary = true;
+                if obj.Options.requireOperatorConfirmation
+                    obj.OperatorConfirmedStationary = true;
+                end
                 calibrationConfig = getImuCalibrationConfig();
                 obj.Calibrator = obj.Dependencies.createCalibrator(obj.Imu, calibrationConfig);
                 obj.attachCalibratorCallbacks();
@@ -169,29 +203,45 @@ classdef ImuInstallationCalibrationController < handle
                 if obj.Options.performVerification
                     obj.setStatus("VERIFYING",0.93,"Verifying the candidate calibration.");
                     verificationDependencies=struct('sleep',obj.Dependencies.sleep, ...
-                        'beforeForward',@()obj.confirmVerificationForward());
+                        'beforeForward',@()obj.confirmVerificationForward(), ...
+                        'checkCancelled',@()obj.checkCancelled(), ...
+                        'onProgress',@(phase,collected,required)obj.onVerificationProgress( ...
+                            phase,collected,required));
                     obj.VerificationReport = verifyImuInstallationCalibration( ...
                         obj.Imu,obj.Calibration,obj.Options,verificationDependencies);
+                    obj.checkCancelled();
+                    obj.Calibration.metadata.verificationPerformed = true;
+                    obj.Calibration.metadata.verificationPassed = obj.VerificationReport.success;
+                    obj.Calibration.metadata.verificationScore = obj.VerificationReport.score;
+                    obj.Calibration.metadata.verificationCompletedAt = obj.Dependencies.nowUtc();
                     if obj.VerificationReport.forwardAccelerationMean <= 0
+                        obj.saveFailedVerificationDiagnostics();
                         error('IMU:CalibrationForwardAxisReversed', ...
                             'Verification detected a reversed forward axis.');
                     end
                     if ~obj.VerificationReport.success
+                        obj.saveFailedVerificationDiagnostics();
                         error('IMU:CalibrationVerificationFailed','%s', ...
                             strjoin(obj.VerificationReport.errors,' '));
                     end
                 else
-                    obj.VerificationReport = struct('success',true,'score',1, ...
-                        'errors',strings(0,1),'warnings',strings(0,1));
+                    obj.VerificationReport = [];
+                    obj.Calibration.metadata.verificationPerformed = false;
+                    obj.Calibration.metadata.verificationPassed = false;
+                    obj.Calibration.metadata.verificationScore = NaN;
+                    obj.Calibration.metadata.verificationCompletedAt = NaT('TimeZone','UTC');
                 end
-                obj.Calibration.metadata.verificationPassed = true;
-                obj.Calibration.metadata.verificationScore = obj.VerificationReport.score;
+                obj.synchronizeOperatorMetadata();
+                obj.setStatus("SAVING",0.97,"Saving verified working calibration.");
+                obj.checkCancelled();
                 obj.saveWorkingCandidate();
                 obj.setStatus("SAVING",0.98,"Saving verified calibration atomically.");
+                obj.checkCancelled();
                 obj.persistCandidate();
                 obj.setStatus("READY",1,"Installation calibration is ready.");
                 obj.finishSuccess();
             catch exception
+                obj.recordError(exception);
                 if strcmp(exception.identifier,'IMU:CalibrationCancelled') || obj.CancelRequested
                     obj.finishCancelled();
                 else
@@ -246,20 +296,23 @@ classdef ImuInstallationCalibrationController < handle
         end
 
         function onCalibratorStatus(obj,status)
+            obj.copySampleStatus(status);
             state = string(status.state);
-            if state == "WAIT_FORWARD_ACCELERATION" && ~obj.OperatorConfirmedForward
-                obj.setStatus("OPERATOR_CONFIRMATION",max(.49,status.progress),obj.forwardPrompt());
-                if obj.Options.requireOperatorConfirmation && ...
-                        ~obj.Dependencies.confirm(obj.forwardPrompt())
+            if state == "WAIT_FORWARD_ACCELERATION" && ~obj.CalibrationForwardDecisionHandled
+                if ~obj.requestConfirmation(obj.forwardPrompt(),max(.49,status.progress))
                     obj.cancel(); return;
                 end
-                obj.OperatorConfirmedForward = true;
+                if obj.Options.requireOperatorConfirmation
+                    obj.OperatorConfirmedForward = true;
+                end
+                obj.CalibrationForwardDecisionHandled = true;
             end
             mapped = obj.mapCalibratorState(state,status.progress);
             obj.setStatus(mapped,status.progress,string(status.message));
         end
 
         function onCalibratorProgress(obj,status)
+            obj.copySampleStatus(status);
             state = obj.mapCalibratorState(string(status.state),status.progress);
             obj.setProgress(state,status.progress);
         end
@@ -292,9 +345,14 @@ classdef ImuInstallationCalibrationController < handle
                 'preflightGeneratedAt',obj.preflightTime(), ...
                 'preflightCallbackFrequencyHz',obj.PreflightReport.callbackFrequencyHz, ...
                 'previousCalibrationBackedUp',false,'previousCalibrationFile',"", ...
-                'verificationPassed',false,'verificationScore',NaN, ...
-                'operatorConfirmedStationary',obj.OperatorConfirmedStationary, ...
-                'operatorConfirmedForward',true);
+                'operatorConfirmationRequired',obj.Options.requireOperatorConfirmation, ...
+                'operatorConfirmationMode',obj.confirmationMode(), ...
+                'operatorConfirmedStationary',false, ...
+                'operatorConfirmedForward',false, ...
+                'operatorConfirmedVerificationForward',false, ...
+                'verificationPerformed',false,'verificationPassed',false, ...
+                'verificationScore',NaN, ...
+                'verificationCompletedAt',NaT('TimeZone','UTC'));
         end
 
         function value = preflightTime(obj)
@@ -315,6 +373,7 @@ classdef ImuInstallationCalibrationController < handle
             directory = fileparts(char(obj.FinalFile));
             if ~isfolder(directory), mkdir(directory); end
             if isfile(obj.FinalFile) && obj.Options.backupExistingCalibration
+                obj.checkCancelled();
                 archive = fullfile(directory,'archive');
                 if ~isfolder(archive), mkdir(archive); end
                 timestamp = obj.Dependencies.nowUtc();
@@ -327,7 +386,39 @@ classdef ImuInstallationCalibrationController < handle
                 obj.Calibration.metadata.previousCalibrationFile = obj.BackupFile;
                 obj.saveWorkingCandidate();
             end
-            obj.Dependencies.moveFile(char(obj.WorkingFile),char(obj.FinalFile));
+            obj.setStatus("SAVING",0.99,"Activating and verifying final calibration.");
+            obj.checkCancelled();
+            obj.ActivationAttempted = true;
+            try
+                obj.Dependencies.moveFile(char(obj.WorkingFile),char(obj.FinalFile));
+                activated = obj.Dependencies.loadCalibration(char(obj.FinalFile), ...
+                    obj.BusId,string(obj.PreflightReport.uid));
+                obj.verifyActivatedCalibration(activated);
+                obj.Calibration = activated;
+                obj.ActivationVerified = true;
+            catch activationException
+                obj.recordError(activationException);
+                if strlength(obj.BackupFile)>0 && isfile(obj.BackupFile)
+                    try
+                        obj.rollbackFromBackup();
+                    catch rollbackException
+                        obj.recordError(rollbackException);
+                        obj.PreserveDiagnostics = true;
+                        obj.ensureWorkingDiagnostics();
+                        failure=MException('IMU:CalibrationRollbackFailed', ...
+                            'Activation failed (%s) and rollback failed (%s).', ...
+                            activationException.message,rollbackException.message);
+                        failure=addCause(failure,activationException);
+                        failure=addCause(failure,rollbackException);
+                        throw(failure);
+                    end
+                elseif isfile(obj.FinalFile)
+                    try, obj.Dependencies.deleteFile(char(obj.FinalFile)); catch cleanupException
+                        obj.recordError(cleanupException);
+                    end
+                end
+                rethrow(activationException);
+            end
         end
 
         function finishSuccess(obj)
@@ -346,7 +437,7 @@ classdef ImuInstallationCalibrationController < handle
         function finishFailure(obj,exception)
             obj.State="FAILED"; obj.Message=string(exception.message); obj.LastError=exception;
             obj.IsRunning=false; obj.CompletedAt=obj.Dependencies.nowUtc();
-            if ~obj.Options.keepFailedWorkingFiles, obj.safeDeleteWorking(); end
+            if ~obj.Options.keepFailedWorkingFiles && ~obj.PreserveDiagnostics, obj.safeDeleteWorking(); end
             obj.restoreStreamIfAllowed(false); obj.destroyTimer();
             obj.Result=obj.makeResult(); obj.safeCallback(obj.OnError,exception);
         end
@@ -376,17 +467,42 @@ classdef ImuInstallationCalibrationController < handle
         end
 
         function result = makeResult(obj)
-            errors=strings(0,1); warnings=strings(0,1);
-            if ~isempty(obj.LastError), errors=string(obj.LastError.message); end
-            if isstruct(obj.VerificationReport) && isfield(obj.VerificationReport,'warnings')
-                warnings=string(obj.VerificationReport.warnings);
+            errors=obj.ErrorMessages; warnings=strings(0,1);
+            if isstruct(obj.PreflightReport)
+                if isfield(obj.PreflightReport,'errors'), errors=[string(obj.PreflightReport.errors(:));errors]; end
+                if isfield(obj.PreflightReport,'warnings'), warnings=[warnings;string(obj.PreflightReport.warnings(:))]; end
             end
+            if isstruct(obj.ValidationReport) && isfield(obj.ValidationReport,'errors')
+                errors=[errors;string(obj.ValidationReport.errors(:))];
+            end
+            if isstruct(obj.VerificationReport) && isfield(obj.VerificationReport,'warnings')
+                warnings=[warnings;string(obj.VerificationReport.warnings(:))];
+                if isfield(obj.VerificationReport,'errors')
+                    errors=[errors;string(obj.VerificationReport.errors(:))];
+                end
+            end
+            errors=unique(errors(strlength(errors)>0),'stable');
+            warnings=unique(warnings(strlength(warnings)>0),'stable');
             result=struct('success',obj.State=="READY",'cancelled',obj.State=="CANCELLED", ...
                 'state',obj.State,'calibration',obj.Calibration,'preflight',obj.PreflightReport, ...
                 'validation',obj.ValidationReport,'verification',obj.VerificationReport, ...
                 'finalFile',obj.FinalFile,'backupFile',obj.BackupFile, ...
                 'workingFile',obj.WorkingFile,'startedAt',obj.StartedAt, ...
                 'completedAt',obj.CompletedAt,'errors',errors,'warnings',warnings);
+            result.errorIdentifier=""; result.errorMessage="";
+            if ~isempty(obj.LastError)
+                result.errorIdentifier=string(obj.LastError.identifier);
+                result.errorMessage=string(obj.LastError.message);
+            end
+            result.errorIdentifiers=obj.ErrorIdentifiers;
+            result.verificationPerformed=isstruct(obj.Calibration) && ...
+                isfield(obj.Calibration,'metadata') && ...
+                isfield(obj.Calibration.metadata,'verificationPerformed') && ...
+                logical(obj.Calibration.metadata.verificationPerformed);
+            result.activationAttempted=obj.ActivationAttempted;
+            result.activationVerified=obj.ActivationVerified;
+            result.rollbackAttempted=obj.RollbackAttempted;
+            result.rollbackSucceeded=obj.RollbackSucceeded;
         end
 
         function safeCallback(obj,callback,value)
@@ -436,13 +552,153 @@ classdef ImuInstallationCalibrationController < handle
 
         function confirmVerificationForward(obj)
             obj.checkCancelled();
-            obj.setStatus("OPERATOR_CONFIRMATION",0.95, ...
-                "Confirm the separate straight-forward verification manoeuvre.");
-            if obj.Options.requireOperatorConfirmation && ...
-                    ~obj.Dependencies.confirm(obj.forwardPrompt())
+            if ~obj.requestConfirmation(obj.forwardPrompt(),0.95)
                 obj.cancel(); obj.checkCancelled();
             end
+            if obj.Options.requireOperatorConfirmation
+                obj.OperatorConfirmedVerificationForward = true;
+            end
+            obj.checkCancelled();
             obj.setStatus("VERIFYING",0.96,"Collecting forward verification samples.");
+        end
+
+        function confirmed=requestConfirmation(obj,prompt,progress)
+            if ~obj.Options.requireOperatorConfirmation
+                confirmed=true;
+                return;
+            end
+            obj.Phase="operator_confirmation";
+            obj.SamplesRequired=0; obj.SamplesCollected=0;
+            if obj.Options.enableDashboard
+                obj.ConfirmationDecision=NaN;
+                obj.ConfirmationPending=true;
+            end
+            obj.setStatus("OPERATOR_CONFIRMATION",progress,prompt);
+            obj.checkCancelled();
+            if obj.Options.enableDashboard
+                while obj.ConfirmationPending
+                    obj.checkCancelled();
+                    drawnow;
+                    obj.Dependencies.sleep(obj.Options.pollStatusSeconds);
+                end
+                confirmed=logical(obj.ConfirmationDecision);
+            else
+                confirmed=logical(obj.Dependencies.confirm(prompt));
+            end
+            obj.checkCancelled();
+        end
+
+        function onVerificationProgress(obj,phase,collected,required)
+            obj.Phase=string(phase);
+            obj.SamplesCollected=double(collected);
+            obj.SamplesRequired=double(required);
+            if obj.Phase=="verification_stationary"
+                progress=.93+.02*collected/required;
+            else
+                progress=.96+.01*collected/required;
+            end
+            obj.setProgress("VERIFYING",progress);
+        end
+
+        function copySampleStatus(obj,status)
+            fields={'samplesRequired','samplesCollected','phase'};
+            for index=1:numel(fields)
+                if isfield(status,fields{index})
+                    if strcmp(fields{index},'phase'), obj.Phase=string(status.(fields{index}));
+                    elseif strcmp(fields{index},'samplesRequired'), obj.SamplesRequired=double(status.(fields{index}));
+                    else, obj.SamplesCollected=double(status.(fields{index})); end
+                end
+            end
+        end
+
+        function synchronizeOperatorMetadata(obj)
+            obj.Calibration.metadata.operatorConfirmedStationary=obj.OperatorConfirmedStationary;
+            obj.Calibration.metadata.operatorConfirmedForward=obj.OperatorConfirmedForward;
+            obj.Calibration.metadata.operatorConfirmedVerificationForward= ...
+                obj.OperatorConfirmedVerificationForward;
+        end
+
+        function mode=confirmationMode(obj)
+            if ~obj.Options.requireOperatorConfirmation, mode="disabled";
+            elseif obj.DependenciesInjected, mode="test";
+            else, mode="interactive"; end
+        end
+
+        function saveFailedVerificationDiagnostics(obj)
+            obj.synchronizeOperatorMetadata();
+            try, obj.saveWorkingCandidate();
+            catch exception, obj.recordError(exception); end
+        end
+
+        function verifyActivatedCalibration(obj,activated)
+            report=validateImuCalibration(activated);
+            if ~report.valid
+                error('IMU:CalibrationActivationValidationFailed','%s',strjoin(report.errors,' '));
+            end
+            metadata=activated.metadata;
+            if string(metadata.busId)~=obj.BusId
+                error('IMU:CalibrationBusMismatch','Activated calibration bus ID is incorrect.');
+            end
+            if string(metadata.imuUid)~=string(obj.PreflightReport.uid)
+                error('IMU:CalibrationDeviceMismatch','Activated calibration UID is incorrect.');
+            end
+            provenance={'verificationPerformed','verificationPassed'};
+            if ~all(isfield(metadata,provenance))
+                error('IMU:CalibrationActivationValidationFailed', ...
+                    'Activated calibration is missing verification provenance.');
+            end
+            if obj.Options.performVerification && ...
+                    ~(logical(metadata.verificationPerformed)&&logical(metadata.verificationPassed))
+                error('IMU:CalibrationActivationValidationFailed', ...
+                    'Activated calibration did not pass performed verification.');
+            end
+            candidate=obj.Calibration;
+            rotationDifference=norm(activated.rotationVehicleFromSensor- ...
+                candidate.rotationVehicleFromSensor,'fro');
+            linearBiasDifference=norm(activated.bias.linearAccelerationSensor- ...
+                candidate.bias.linearAccelerationSensor);
+            angularBiasDifference=norm(activated.bias.angularVelocitySensor- ...
+                candidate.bias.angularVelocitySensor);
+            if rotationDifference>1e-10 || linearBiasDifference>1e-10 || ...
+                    angularBiasDifference>1e-10 || ...
+                    abs(activated.quality.score-candidate.quality.score)>1e-12
+                error('IMU:CalibrationActivationMismatch', ...
+                    'Activated calibration differs from the verified candidate.');
+            end
+        end
+
+        function rollbackFromBackup(obj)
+            obj.RollbackAttempted=true;
+            if isfile(obj.FinalFile), obj.Dependencies.deleteFile(char(obj.FinalFile)); end
+            obj.Dependencies.copyFile(char(obj.BackupFile),char(obj.FinalFile));
+            restored=obj.Dependencies.loadCalibration(char(obj.FinalFile), ...
+                obj.BusId,string(obj.PreflightReport.uid));
+            report=validateImuCalibration(restored);
+            if ~report.valid
+                error('IMU:CalibrationRollbackValidationFailed','%s',strjoin(report.errors,' '));
+            end
+            obj.RollbackSucceeded=true;
+        end
+
+        function ensureWorkingDiagnostics(obj)
+            try
+                calibration=obj.Calibration; %#ok<NASGU>
+                directory=fileparts(char(obj.WorkingFile));
+                if ~isfolder(directory), mkdir(directory); end
+                save(char(obj.WorkingFile),'calibration');
+            catch exception
+                obj.recordError(exception);
+            end
+        end
+
+        function recordError(obj,exception)
+            identifier=string(exception.identifier);
+            message=string(exception.message);
+            duplicate=any(obj.ErrorIdentifiers==identifier & obj.ErrorMessages==message);
+            if ~duplicate
+                obj.ErrorIdentifiers(end+1,1)=identifier;
+                obj.ErrorMessages(end+1,1)=message;
+            end
         end
     end
 

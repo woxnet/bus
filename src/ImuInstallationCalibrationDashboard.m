@@ -40,7 +40,8 @@ classdef ImuInstallationCalibrationDashboard < handle
             obj.QualityLabel=uilabel(grid,'Text','Quality: —'); obj.QualityLabel.Layout.Column=[1 2];
             obj.VerificationLabel=uilabel(grid,'Text','Verification: —'); obj.VerificationLabel.Layout.Column=[1 2];
             obj.StartButton=uibutton(grid,'Text','Start','ButtonPushedFcn',@(~,~)obj.start());
-            obj.ConfirmButton=uibutton(grid,'Text','Confirm','Enable','off');
+            obj.ConfirmButton=uibutton(grid,'Text','Confirm','Enable','off', ...
+                'ButtonPushedFcn',@(~,~)controller.confirmCurrentStep());
             obj.CancelButton=uibutton(grid,'Text','Cancel','ButtonPushedFcn',@(~,~)controller.cancel());
             obj.CloseButton=uibutton(grid,'Text','Close','ButtonPushedFcn',@(~,~)obj.requestClose());
             obj.PreviousStateCallback=controller.OnStateChanged;
@@ -79,11 +80,15 @@ classdef ImuInstallationCalibrationDashboard < handle
             obj.StateLabel.Text=char(status.state);
             obj.MessageLabel.Text=char(status.message);
             obj.ProgressGauge.Value=100*status.progress;
+            obj.SamplesLabel.Text=sprintf('Phase: %s | Samples: %d / %d | Remaining: %d', ...
+                char(status.phase),status.samplesCollected,status.samplesRequired,status.samplesRemaining);
             obj.QualityLabel.Text=sprintf('Quality: %s',obj.number(status.quality));
             obj.VerificationLabel.Text=sprintf('Verification: %s',obj.number(status.verification));
             if isempty(status.lastError), obj.ErrorLabel.Text='Last error: —';
             else, obj.ErrorLabel.Text=['Last error: ' status.lastError.message]; end
             if status.state=="IDLE", obj.StartButton.Enable='on'; else, obj.StartButton.Enable='off'; end
+            if status.state=="OPERATOR_CONFIRMATION", obj.ConfirmButton.Enable='on';
+            else, obj.ConfirmButton.Enable='off'; end
             if status.isRunning, obj.CancelButton.Enable='on'; obj.CloseButton.Enable='off';
             else, obj.CancelButton.Enable='off'; obj.CloseButton.Enable='on'; end
         end

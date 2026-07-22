@@ -9,6 +9,9 @@ classdef TestImuInstallationCalibrationDashboard < matlab.unittest.TestCase
             testCase.verifyNotEmpty(strfind(source,'Close')); %#ok<STRIFCND>
             testCase.verifyEmpty(strfind(source,'buildRotation')); %#ok<STRIFCND>
             testCase.verifyEmpty(strfind(source,'calculateQuality')); %#ok<STRIFCND>
+            testCase.verifyNotEmpty(strfind(source,'confirmCurrentStep')); %#ok<STRIFCND>
+            testCase.verifyNotEmpty(strfind(source,'samplesRemaining')); %#ok<STRIFCND>
+            testCase.verifyNotEmpty(strfind(source,'status.state=="OPERATOR_CONFIRMATION"')); %#ok<STRIFCND>
         end
     end
 end

@@ -138,6 +138,12 @@ copies the previous file to `calibration/archive/` with a UTC timestamp. Failed
 and cancelled workflows remove the working file by default and preserve the
 old final calibration.
 
+Activation is not considered successful until the final MAT-file is reloaded,
+validated against bus ID and IMU UID, and compared with the verified candidate
+rotation, biases, and quality score. If activation fails after a backup was
+created, the controller restores and validates that backup. A rollback failure
+preserves both the backup and working candidate for manual recovery.
+
 Recalibration is mandatory after moving or replacing the IMU, loosening its
 mount, changing enclosure orientation, repairing the mounting surface, or a
 material degradation of verification metrics.
