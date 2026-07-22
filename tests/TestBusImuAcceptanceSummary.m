@@ -68,9 +68,9 @@ classdef TestBusImuAcceptanceSummary < matlab.unittest.TestCase
         end
         function hardwareReportProducersExposeIdentityContract(testCase)
             root=fileparts(fileparts(mfilename('fullpath')));
-            files={fullfile(root,'examples','run_installation_calibration_hardware_acceptance.m'), ...
+            files={fullfile(root,'src','runInstallationCalibrationHardwareAcceptance.m'), ...
                 fullfile(root,'src','runImuHardwareAcceptance.m'), ...
-                fullfile(root,'examples','run_realtime_hardware_acceptance.m')};
+                fullfile(root,'src','runRealtimeHardwareAcceptance.m')};
             required=["commit" "uid" "busId" "firmwareVersion" "sensorFusionMode"];
             for file=files
                 source=string(fileread(file{1}));

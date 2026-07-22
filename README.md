@@ -105,6 +105,21 @@ the callback phase validates decoded sensor payloads rather than metadata only.
 
 ## Hardware acceptance
 
+Before physical acceptance, start from a clean MATLAB process and verify the
+loaded class definitions against the checkout:
+
+```matlab
+restoredefaultpath;
+rehash toolboxcache;
+cd("<repository>");
+run("startup.m");
+assertImuAcceptanceClassApi();
+```
+
+After updating `ImuBrick2`, `ImuInstallationCalibrationController`, or
+`RealtimeDrivingMonitor`, fully restart MATLAB. Re-running `startup.m` alone
+does not replace handle-class definitions that are already loaded.
+
 With the physical IMU connected, run the controlled 60-second FIFO test:
 
 ```matlab
@@ -167,7 +182,7 @@ To run installation calibration, the standalone IMU acceptance, and the
 real-time monitor acceptance with one combined MAT/JSON summary, use:
 
 ```matlab
-run("examples/run_full_imu_hardware_acceptance.m");
+combined = runFullImuHardwareAcceptance();
 ```
 
 ## Offline driving-event analysis

@@ -8,8 +8,7 @@ validateattributes(durationSeconds, {'numeric'}, {'scalar','positive'});
 outputDirectory = resolveProjectPath(outputDirectory);
 if ~isfolder(outputDirectory), mkdir(outputDirectory); end
 identity=imu.getIdentity(); sensorFusionMode=imu.getSensorFusionMode();
-[gitStatus,commit]=system('git rev-parse HEAD');
-if gitStatus~=0, commit="unknown"; else, commit=strtrim(string(commit)); end
+commit=getImuAcceptanceCommit();
 
 imu.start(config.callbackPeriodMs);
 streamOwner = string(imu.StreamOwner);
