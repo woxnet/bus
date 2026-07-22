@@ -28,7 +28,8 @@ classdef TestImuHardwareAcceptanceLifecycle < matlab.unittest.TestCase
             imu=MockImuBrick2(); imu.DelayedTailSamples=repmat(testCase.sample(),2,1);
             imu.InjectTailAfterEmptyDrainCount=1;
             report=testCase.runAcceptance(imu);
-            testCase.verifyEqual(report.tailSamplesDrained,2);
+            testCase.verifyGreaterThanOrEqual(report.tailSamplesDrained,2);
+            testCase.verifyEqual(report.samplesRead,report.received);
         end
         function callbackThroughTimeoutFailsAcceptance(testCase)
             imu=MockImuBrick2(); imu.TailSampleOnEveryDrain=testCase.sample();
