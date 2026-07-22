@@ -74,6 +74,10 @@ classdef RealtimeDrivingMonitor < handle
         RecorderFailed=false
         UnrecordedSamplesAfterRecorderFailure=0
         FatalStopRequested=false
+        BatchProcessing=false
+        DeferredStopRequested=false
+        DeferredStopReason=""
+        LastRecordingStorageGuardSeconds=-Inf
     end
 
     methods
@@ -133,7 +137,7 @@ classdef RealtimeDrivingMonitor < handle
                 obj.IsRunning=true;
                 if obj.Config.UseTimer, start(obj.Timer); end
                 obj.evaluateRecordingGuards();
-                if obj.FatalStopRequested, obj.stop(); end
+                if obj.FatalStopRequested, obj.stop(obj.StopReason); end
             catch exception
                 obj.rollbackStart();
                 obj.recordInternalError(exception);
@@ -154,23 +158,37 @@ classdef RealtimeDrivingMonitor < handle
                 overflow=obj.observeCallbackStats(stats);
                 if ~obj.IsRunning || obj.IsStopping, return; end
                 samples=obj.Imu.drainCallbackSamples(obj.Config.maximumPollSamples);
+                obj.BatchProcessing=true;
+                batchCleanup=onCleanup(@()obj.finishBatchProcessing());
                 for index=1:numel(samples)
                     obj.processSample(samples{index},overflow);
                 end
                 obj.OverflowSincePreviousPoll=false;
                 obj.ConsecutiveErrors=0;
                 obj.evaluateRecordingGuards();
-                if obj.FatalStopRequested && obj.IsRunning, obj.stop(); end
+                if obj.FatalStopRequested && obj.IsRunning, obj.stop(obj.StopReason); end
+                clear batchCleanup;
             catch exception
                 obj.ConsecutiveErrors=obj.ConsecutiveErrors+1;
                 obj.recordInternalError(exception);
                 if obj.ConsecutiveErrors>=obj.Config.maximumConsecutiveErrors
-                    obj.stop();
+                    obj.stop("consecutive_errors");
                 end
             end
         end
 
-        function summary=stop(obj)
+        function summary=stop(obj,reason)
+            if nargin<2 || strlength(string(reason))==0, reason="operator_stop"; end
+            reason=string(reason);
+            if obj.BatchProcessing && ~obj.IsStopping
+                obj.DeferredStopRequested=true;
+                if strlength(obj.DeferredStopReason)==0
+                    obj.DeferredStopReason=reason;
+                end
+                obj.StopReason=obj.DeferredStopReason;
+                summary=obj.makeSummary([],0,0,false);
+                return;
+            end
             if obj.IsStopping
                 if isempty(obj.LastStopSummary), summary=obj.makeSummary([],0,0,false); else, summary=obj.LastStopSummary; end
                 return;
@@ -179,6 +197,7 @@ classdef RealtimeDrivingMonitor < handle
                 if isempty(obj.LastStopSummary), summary=obj.makeSummary([],0,0,false); else, summary=obj.LastStopSummary; end
                 return;
             end
+            obj.StopReason=reason;
             obj.IsStopping=true;
             safety=onCleanup(@()obj.forceStoppedState());
             tailSamples=0; drainDuration=0; drainTimedOut=false; recording=[];
@@ -278,6 +297,8 @@ classdef RealtimeDrivingMonitor < handle
             obj.StopReason="operator_stop"; obj.RecordingFinalStatus="complete";
             obj.RecorderFailed=false; obj.UnrecordedSamplesAfterRecorderFailure=0;
             obj.FatalStopRequested=false;
+            obj.BatchProcessing=false; obj.DeferredStopRequested=false;
+            obj.DeferredStopReason=""; obj.LastRecordingStorageGuardSeconds=-Inf;
             obj.Recorder=[]; obj.OwnsRecorder=false; obj.Dashboard=[]; obj.Timer=[];
             obj.resetProcessingState(); obj.PendingEvents=cell(5,1);
             sampleCapacity=max(1,ceil(obj.Config.historySeconds*obj.Config.sampleRateHz));
@@ -386,7 +407,9 @@ classdef RealtimeDrivingMonitor < handle
                 obj.OverflowDropped=double(stats.overflowDropped); obj.OverflowSincePreviousPoll=true;
                 obj.finishActiveEvents("overflow",0); obj.flushPendingEvents(); obj.resetProcessingState();
                 obj.recordQualityWarning(struct('type',"CALLBACK_OVERFLOW",'count',increment,'total',obj.OverflowDropped));
-                if obj.Config.stopOnOverflow && obj.IsRunning && ~obj.IsStopping, obj.stop(); end
+                if obj.Config.stopOnOverflow && obj.IsRunning && ~obj.IsStopping
+                    obj.stop("callback_overflow");
+                end
             end
             if double(stats.staleSessionDropped)>obj.StaleSessionDropped
                 obj.StaleSessionDropped=double(stats.staleSessionDropped);
@@ -410,7 +433,9 @@ classdef RealtimeDrivingMonitor < handle
                 gapBefore=true; missing=double(sequence-obj.LastSequence-1);
                 obj.MissingSamples=obj.MissingSamples+missing;
                 obj.finishActiveEvents("sequence_gap",missing); obj.flushPendingEvents(); obj.resetProcessingState();
-                if obj.Config.stopOnSequenceGap && obj.IsRunning && ~obj.IsStopping, obj.stop(); return; end
+                if obj.Config.stopOnSequenceGap && obj.IsRunning && ~obj.IsStopping
+                    obj.stop("sequence_gap");
+                end
             end
             if obj.FirstSequence==0, obj.FirstSequence=sequence; end
             obj.LastSequence=sequence;
@@ -642,6 +667,8 @@ classdef RealtimeDrivingMonitor < handle
                 'tailSamplesDrained',double(tailSamples),'stopDrainDurationSeconds',double(drainDuration), ...
                 'stopDrainTimedOut',logical(drainTimedOut),'recording',recording,'lastError',obj.LastError, ...
                 'stopReason',obj.StopReason, ...
+                'stopDeferredUntilBatchBoundary',strlength(obj.DeferredStopReason)>0, ...
+                'deferredStopReason',obj.DeferredStopReason, ...
                 'unrecordedSamplesAfterRecorderFailure',obj.UnrecordedSamplesAfterRecorderFailure);
             summary.finalCallbackStats=obj.FinalCallbackStats;
         end
@@ -676,10 +703,13 @@ classdef RealtimeDrivingMonitor < handle
                 return;
             end
             reason=""; message="";
-            if obj.monotonicElapsed()>=obj.Config.maximumRecordingDurationSeconds
+            elapsed=obj.monotonicElapsed();
+            if elapsed>=obj.Config.maximumRecordingDurationSeconds
                 reason="maximum_recording_duration";
                 message="Maximum recording duration reached.";
-            else
+            elseif elapsed-obj.LastRecordingStorageGuardSeconds>= ...
+                    obj.Config.recordingGuardPeriodSeconds
+                obj.LastRecordingStorageGuardSeconds=elapsed;
                 freeBytes=obj.Dependencies.getFreeDiskBytes(obj.Config.recordingDirectory);
                 if freeBytes<obj.Config.minimumFreeDiskBytes
                     reason="minimum_free_disk"; message="Minimum free disk reserve reached.";
@@ -692,6 +722,13 @@ classdef RealtimeDrivingMonitor < handle
                 obj.StopReason=reason; obj.RecordingFinalStatus="incomplete";
                 obj.FatalStopRequested=true;
                 obj.recordOperationalWarning(upper(reason),message);
+            end
+        end
+        function finishBatchProcessing(obj)
+            obj.BatchProcessing=false;
+            if obj.DeferredStopRequested && obj.IsRunning && ~obj.IsStopping
+                obj.DeferredStopRequested=false;
+                obj.stop(obj.DeferredStopReason);
             end
         end
         function invokeCallback(obj,callback,payload)

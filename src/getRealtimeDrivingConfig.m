@@ -42,6 +42,7 @@ config.recordingDirectory = "sessions";
 config.maximumRecordingDurationSeconds = 8 * 60 * 60;
 config.minimumFreeDiskBytes = 1024^3;
 config.maximumSessionBytes = 20 * 1024^3;
+config.recordingGuardPeriodSeconds = 1.0;
 config.UseTimer = true;
 config.DisconnectImuOnDelete = false;
 config.AllowSyntheticCalibration = false;

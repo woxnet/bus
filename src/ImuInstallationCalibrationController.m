@@ -56,6 +56,8 @@ classdef ImuInstallationCalibrationController < handle
         PreserveDiagnostics = false
         DependenciesInjected = false
         Deleting = false
+        ExecutionActive = false
+        CloseCleanupRequested = false
     end
 
     methods
@@ -108,6 +110,11 @@ classdef ImuInstallationCalibrationController < handle
 
         function close(obj)
             %CLOSE Cooperatively cancel and wait for an asynchronous workflow.
+            obj.CloseCleanupRequested=true;
+            if obj.ExecutionActive
+                if obj.IsRunning, obj.cancel("controller_closed"); end
+                return;
+            end
             if obj.IsRunning, obj.cancel("controller_closed"); end
             started=tic;
             while obj.IsRunning && toc(started)<5
@@ -196,6 +203,8 @@ classdef ImuInstallationCalibrationController < handle
         end
 
         function executeWorkflow(obj)
+            obj.ExecutionActive=true;
+            executionCleanup=onCleanup(@()obj.finishExecution());
             try
                 obj.checkCancelled();
                 obj.acquireExclusiveAccess();
@@ -270,6 +279,7 @@ classdef ImuInstallationCalibrationController < handle
                     obj.finishFailure(exception);
                 end
             end
+            clear executionCleanup;
         end
 
         function acquireExclusiveAccess(obj)
@@ -449,7 +459,7 @@ classdef ImuInstallationCalibrationController < handle
 
         function finishSuccess(obj)
             obj.IsRunning=false; obj.CompletedAt=obj.Dependencies.nowUtc();
-            obj.restoreStreamIfAllowed(true); obj.destroyTimer();
+            obj.restoreStreamIfAllowed(true);
             obj.Result=obj.makeResult(); obj.safeCallback(obj.OnCompleted,obj.Result);
         end
 
@@ -457,7 +467,6 @@ classdef ImuInstallationCalibrationController < handle
             obj.State="CANCELLED"; obj.Message="Calibration cancelled.";
             obj.LastError=[];
             obj.IsRunning=false; obj.CompletedAt=obj.Dependencies.nowUtc();
-            obj.safeDeleteWorking(); obj.restoreStreamIfAllowed(false); obj.destroyTimer();
             obj.Result=obj.makeResult(); obj.safeCallback(obj.OnCancelled,obj.Result);
         end
 
@@ -465,8 +474,21 @@ classdef ImuInstallationCalibrationController < handle
             obj.State="FAILED"; obj.Message=string(exception.message); obj.LastError=exception;
             obj.IsRunning=false; obj.CompletedAt=obj.Dependencies.nowUtc();
             if ~obj.Options.keepFailedWorkingFiles && ~obj.PreserveDiagnostics, obj.safeDeleteWorking(); end
-            obj.restoreStreamIfAllowed(false); obj.destroyTimer();
+            obj.restoreStreamIfAllowed(false);
             obj.Result=obj.makeResult(); obj.safeCallback(obj.OnError,exception);
+        end
+
+        function finishExecution(obj)
+            obj.ExecutionActive=false;
+            if obj.State=="CANCELLED"
+                obj.safeDeleteWorking();
+                obj.restoreStreamIfAllowed(false);
+            end
+            obj.destroyTimer();
+            if obj.CloseCleanupRequested && ~isempty(obj.Dashboard)
+                try, delete(obj.Dashboard); catch, end
+                obj.Dashboard=[];
+            end
         end
 
         function restoreStreamIfAllowed(obj,success)

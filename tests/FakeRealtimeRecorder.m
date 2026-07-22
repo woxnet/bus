@@ -6,6 +6,7 @@ classdef FakeRealtimeRecorder < handle
         FinalizedWhileStreaming=false
         SessionBytes=0
         FinalizedStreamOwner=""
+        SessionBytesCalls=0
     end
     properties
         FailOnStart=false
@@ -44,7 +45,9 @@ classdef FakeRealtimeRecorder < handle
                 'received',double(stats.received),'status',string(status), ...
                 'stopReason',string(reason));
         end
-        function bytes=getSessionBytes(obj), bytes=obj.SessionBytes; end
+        function bytes=getSessionBytes(obj)
+            obj.SessionBytesCalls=obj.SessionBytesCalls+1; bytes=obj.SessionBytes;
+        end
         function delete(obj), obj.IsRecording=false; obj.Deleted=true; end
     end
 end

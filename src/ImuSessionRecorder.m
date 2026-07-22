@@ -8,6 +8,8 @@ classdef ImuSessionRecorder < handle
         SamplesWritten = 0
         DuplicateSamples = 0
         MissingSamples = 0
+        BytesWritten = 0
+        EstimatedBufferedBytes = 0
     end
     properties (Access = private)
         Imu
@@ -20,6 +22,7 @@ classdef ImuSessionRecorder < handle
         StreamSessionId = uint64(0)
         Gaps = zeros(0, 3)
         ExternalMode = false
+        TrackedFileBytes = []
     end
 
     methods
@@ -103,11 +106,7 @@ classdef ImuSessionRecorder < handle
         end
 
         function bytes=getSessionBytes(obj)
-            bytes=0;
-            if strlength(obj.WorkingDirectory)>0 && isfolder(obj.WorkingDirectory)
-                entries=dir(fullfile(char(obj.WorkingDirectory),'**','*'));
-                if ~isempty(entries), bytes=sum(double([entries(~[entries.isdir]).bytes])); end
-            end
+            bytes=obj.BytesWritten+obj.EstimatedBufferedBytes;
         end
 
         function delete(obj)
@@ -157,6 +156,9 @@ classdef ImuSessionRecorder < handle
             vehicle.imuUid = sample.imuUid; vehicle.busId = sample.busId;
             obj.SensorBuffer{end+1, 1} = sample;
             obj.VehicleBuffer{end+1, 1} = vehicle;
+            sensorInfo=whos('sample'); vehicleInfo=whos('vehicle');
+            obj.EstimatedBufferedBytes=obj.EstimatedBufferedBytes+ ...
+                double(sensorInfo.bytes+vehicleInfo.bytes);
             obj.LastSequence = sequence; appended = true;
             if numel(obj.SensorBuffer) >= obj.Options.chunkSize, obj.flushChunk(); end
         end
@@ -183,6 +185,8 @@ classdef ImuSessionRecorder < handle
             obj.ChunkIndex = 0; obj.LastSequence = uint64(0);
             obj.SamplesWritten = 0; obj.DuplicateSamples = 0;
             obj.MissingSamples = 0; obj.Gaps = zeros(0, 3);
+            obj.BytesWritten=0; obj.EstimatedBufferedBytes=0;
+            obj.TrackedFileBytes=containers.Map('KeyType','char','ValueType','double');
         end
 
         function flushChunk(obj)
@@ -193,8 +197,10 @@ classdef ImuSessionRecorder < handle
             filename = fullfile(char(obj.WorkingDirectory), ...
                 sprintf('samples_%06d.mat', obj.ChunkIndex));
             save(filename, 'sensorSamples', 'vehicleSamples', '-v7');
+            obj.trackFileSize(filename);
             obj.SamplesWritten = obj.SamplesWritten + numel(obj.SensorBuffer);
             obj.SensorBuffer = cell(0, 1); obj.VehicleBuffer = cell(0, 1);
+            obj.EstimatedBufferedBytes=0;
         end
 
         function metadata = metadata(obj, status)
@@ -231,7 +237,7 @@ classdef ImuSessionRecorder < handle
                 'chunkCount', obj.ChunkIndex);
         end
 
-        function writeJson(~, filename, value)
+        function writeJson(obj, filename, value)
             temporary = [filename, '.tmp'];
             fileId = fopen(temporary, 'w');
             if fileId < 0, error('IMU:RecorderWriteFailed', 'Cannot write %s.', filename); end
@@ -240,6 +246,21 @@ classdef ImuSessionRecorder < handle
             clear cleanup;
             [success, message] = movefile(temporary, filename, 'f');
             if ~success, error('IMU:RecorderWriteFailed', '%s', message); end
+            obj.trackFileSize(filename);
+        end
+
+        function trackFileSize(obj,filename)
+            info=dir(filename);
+            if isempty(info), return; end
+            key=char(filename); previous=0;
+            if isempty(obj.TrackedFileBytes)
+                obj.TrackedFileBytes=containers.Map('KeyType','char','ValueType','double');
+            elseif isKey(obj.TrackedFileBytes,key)
+                previous=obj.TrackedFileBytes(key);
+            end
+            current=double(info(1).bytes);
+            obj.BytesWritten=obj.BytesWritten-previous+current;
+            obj.TrackedFileBytes(key)=current;
         end
 
         function options = mergeOptions(~, custom)

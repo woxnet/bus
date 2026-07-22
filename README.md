@@ -86,8 +86,9 @@ backlog and returns the newest unread sample; it raises
 `IMU:NoNewCallbackSample` instead of repeating an old sample. Use
 `nextCallbackSample()` or
 `drainCallbackSamples(maxCount)` when every sequential sample is required.
-Callback sequence and received/dropped counters remain monotonic when the
-queue is cleared or the stream is restarted.
+Callback sequence and received/dropped counters are monotonic only within one
+callback session. Clearing the queue or restarting the stream calls
+`beginSession`, which resets that session's sequence and counters.
 
 Normal runtime loads `lib-generated/imu-callback-bridge-v2.jar`. Developers only
 need JDK 8 or newer when rebuilding it reproducibly:

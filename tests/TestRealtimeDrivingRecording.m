@@ -60,6 +60,26 @@ classdef TestRealtimeDrivingRecording < matlab.unittest.TestCase
             recorder.start(); pause(0.03); recorder.poll(); recorder.stop();
             testCase.verifyGreaterThan(imu.DrainCallCount,0);
         end
+        function sessionSizeUsesConstantTimeCounters(testCase)
+            directory=testCase.newDirectory(); imu=MockImuBrick2();
+            recorder=ImuSessionRecorder(imu,createTestImuCalibration(true), ...
+                struct('directory',directory,'AllowSynthetic',true,'chunkSize',10));
+            cleanup=onCleanup(@()delete(recorder)); recorder.startExternal();
+            metadataBytes=recorder.BytesWritten;
+            sensor=MockImuBrick2.makeSample([0 0 -9.81],[0 0 0],[0 0 0]);
+            sensor.sequenceNumber=uint64(1); sensor.sessionId=uint64(1); sensor.callbackAgeMs=0;
+            vehicle=applyMountCalibration(sensor,createTestImuCalibration(true),'AllowSynthetic',true);
+            recorder.appendSample(sensor,vehicle);
+            testCase.verifyGreaterThan(metadataBytes,0);
+            testCase.verifyGreaterThan(recorder.EstimatedBufferedBytes,0);
+            testCase.verifyEqual(recorder.getSessionBytes(), ...
+                recorder.BytesWritten+recorder.EstimatedBufferedBytes);
+            recorder.stopExternal(testCase.stats(1));
+            testCase.verifyEqual(recorder.EstimatedBufferedBytes,0);
+            testCase.verifyEqual(recorder.getSessionBytes(),recorder.BytesWritten);
+            source=string(fileread(which('ImuSessionRecorder')));
+            testCase.verifyFalse(contains(source,"'**'"));
+        end
     end
     methods(Access=private)
         function directory=newDirectory(testCase)

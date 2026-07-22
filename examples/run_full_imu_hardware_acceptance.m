@@ -1,23 +1,27 @@
-% Run every physical IMU acceptance and emit one machine-readable summary.
+% Run every physical IMU acceptance and emit one cross-checked summary.
 acceptanceRoot=fileparts(fileparts(mfilename('fullpath')));
 run(fullfile(acceptanceRoot,'startup.m'));
-combined=struct('success',false,'generatedAt',datetime('now','TimeZone','UTC'), ...
-    'installationCalibration',[],'imuRuntime',[],'realtimeMonitor',[], ...
-    'errors',strings(0,1));
+calibrationReport=struct(); runtimeReport=struct(); realtimeReport=struct();
 try
     run(fullfile(acceptanceRoot,'examples','run_installation_calibration_hardware_acceptance.m'));
-    combined.installationCalibration=report;
-    clear controllerCleanup imuCleanup imu;
+    calibrationReport=report; clear controllerCleanup imuCleanup imu;
     run(fullfile(acceptanceRoot,'examples','run_imu_hardware_acceptance.m'));
-    combined.imuRuntime=report;
-    clear cleanup imu;
+    runtimeReport=report; clear cleanup imu;
     run(fullfile(acceptanceRoot,'examples','run_realtime_hardware_acceptance.m'));
-    combined.realtimeMonitor=report;
-    clear monitorCleanup imuCleanup monitor imu;
-    combined.success=combined.installationCalibration.success && ...
-        combined.imuRuntime.success && combined.realtimeMonitor.success;
+    realtimeReport=report; clear monitorCleanup imuCleanup monitor imu;
 catch exception
-    combined.errors(end+1,1)=string(exception.identifier)+": "+string(exception.message);
+    acceptanceException=exception;
+end
+combined=summarizeBusImuAcceptance(calibrationReport,runtimeReport,realtimeReport);
+combined.generatedAt=datetime('now','TimeZone','UTC');
+combined.calibrationReport=calibrationReport;
+combined.runtimeReport=runtimeReport;
+combined.realtimeReport=realtimeReport;
+combined.errors=strings(0,1);
+if exist('acceptanceException','var')
+    combined.errors(end+1,1)=string(acceptanceException.identifier)+": "+ ...
+        string(acceptanceException.message);
+    combined.success=false;
 end
 artifactDirectory=resolveProjectPath('artifacts');
 if ~isfolder(artifactDirectory), mkdir(artifactDirectory); end
@@ -27,6 +31,12 @@ jsonFile=fullfile(artifactDirectory,['full_imu_acceptance_',stamp,'.json']);
 save(matFile,'combined','-v7');
 fileId=fopen(jsonFile,'w'); assert(fileId>=0); cleanupFile=onCleanup(@()fclose(fileId));
 fprintf(fileId,'%s',jsonencode(combined,'PrettyPrint',true)); clear cleanupFile;
+decoded=jsondecode(fileread(jsonFile));
+required={'success','commitMatch','uidMatch','busIdMatch', ...
+    'sensorFusionModeMatch','calibrationFileExists','calibrationVerified', ...
+    'runtimeSuccess','realtimeSuccess'};
+assert(all(isfield(decoded,required)) && logical(decoded.success)==combined.success, ...
+    'IMU:AcceptanceArtifactInvalid','Combined acceptance JSON failed validation.');
 combined.matFile=string(matFile); combined.jsonFile=string(jsonFile); disp(combined);
 assert(combined.success,"IMU:FullHardwareAcceptanceFailed", ...
     "One or more physical IMU acceptance phases failed.");

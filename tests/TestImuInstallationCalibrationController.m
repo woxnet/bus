@@ -68,6 +68,29 @@ classdef TestImuInstallationCalibrationController < matlab.unittest.TestCase
             testCase.verifyFalse(isvalid(controller));
             testCase.verifyFalse(imu.IsStreaming);
         end
+        function closeFromActiveCallbackIsCooperative(testCase)
+            folder=testCase.tempFolder();
+            final=fullfile(folder,char(getImuConfig().busId+"_imu_mount.mat"));
+            calibration=createTestImuCalibration(false);
+            calibration.metadata.previousMarker="unchanged"; %#ok<NASGU>
+            save(final,'calibration');
+            controller=testCase.controller(folder,testCase.samples(), ...
+                @(~)true,testCase.preflight(true));
+            probe=CalibrationLifecycleProbe();
+            controller.OnProgress=@(source,status)probe.closeDuringSampling(source,status);
+            controller.OnCancelled=@probe.cancelled; controller.OnError=@probe.error;
+            result=controller.runBlocking();
+            testCase.verifyTrue(result.cancelled);
+            testCase.verifyEqual(result.cancelReason,"controller_closed");
+            testCase.verifyEmpty(result.errors);
+            testCase.verifyEqual(probe.CloseCalls,1);
+            testCase.verifyEqual(probe.CancelledCount,1);
+            testCase.verifyEqual(probe.ErrorCount,0);
+            testCase.verifyFalse(isfile(result.workingFile));
+            saved=load(final,'calibration');
+            testCase.verifyEqual(saved.calibration.metadata.previousMarker,"unchanged");
+            delete(controller);
+        end
         function repeatedStartRejected(testCase)
             controller=testCase.controller(testCase.tempFolder(),testCase.samples(), ...
                 @(~)true,testCase.preflight(true));

@@ -125,7 +125,7 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
             testCase.verifyEqual(summary.recording.status,"incomplete");
         end
         function sessionSizeGuardStopsAfterCompleteDrainedBatch(testCase)
-            probe=RealtimeDependencyProbe();
+            probe=RealtimeDependencyProbe(); probe.ClockStep=1;
             [monitor,imu,cleanup]=testCase.monitor(probe,struct('enableRecording',true, ...
                 'maximumSessionBytes',10)); %#ok<ASGLU>
             monitor.startManual(); imu.injectCallbackSamples(testCase.samples(20,0,0,0)); monitor.poll();
@@ -135,6 +135,18 @@ classdef TestRealtimeDrivingLifecycle < matlab.unittest.TestCase
             testCase.verifyEqual(summary.samplesProcessed,20);
             testCase.verifyEqual(summary.recording.samplesWritten,20);
             testCase.verifyEqual(summary.recording.status,"incomplete");
+        end
+        function storageGuardsAreRateLimited(testCase)
+            probe=RealtimeDependencyProbe(); probe.ClockElapsed=0; probe.ClockStep=.02;
+            [monitor,~,cleanup]=testCase.monitor(probe,struct('enableRecording',true, ...
+                'recordingGuardPeriodSeconds',1)); %#ok<ASGLU>
+            monitor.startManual();
+            for index=1:100, monitor.poll(); end
+            testCase.verifyLessThanOrEqual(probe.FreeDiskCalls,3);
+            testCase.verifyLessThanOrEqual(probe.Recorder.SessionBytesCalls,3);
+            testCase.verifyGreaterThanOrEqual(probe.FreeDiskCalls,2);
+            testCase.verifyEqual(probe.Recorder.SessionBytesCalls,probe.FreeDiskCalls);
+            monitor.stop();
         end
         function stopDrainsTailIntoRecorderAndFinalStats(testCase)
             probe=RealtimeDependencyProbe();
