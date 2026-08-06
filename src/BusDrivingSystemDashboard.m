@@ -166,8 +166,9 @@ classdef BusDrivingSystemDashboard < handle
                 obj.MarkerScatters(k)=scatter(ax,nan,nan,28,'filled','MarkerFaceColor',[.85 .2 .2],'HandleVisibility','off');
                 values=obj.thresholdValues(k);
                 for thresholdIndex=1:4
-                    thresholdValue=NaN; if thresholdIndex<=numel(values), thresholdValue=values(thresholdIndex); end
+                    thresholdValue=0; if thresholdIndex<=numel(values), thresholdValue=values(thresholdIndex); end
                     obj.ThresholdLines(k,thresholdIndex)=yline(ax,thresholdValue,':','Color',[.45 .45 .45],'HandleVisibility','off');
+                    if thresholdIndex>numel(values), obj.ThresholdLines(k,thresholdIndex).Visible='off'; end
                 end
                 hold(ax,'off');
             end
