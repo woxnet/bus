@@ -19,12 +19,14 @@ classdef BusDrivingSystemDashboard < handle
         EventTable
         DetectorTable
         QualityTable
+        QualityAxes
         CalibrationTable
         CalibrationAxes
         RecordingTable
         RecordingGauges
         AcceptanceTable
         LogTable
+        LogFilter
         Controls
         Closing=false
         ThresholdConfig
@@ -130,9 +132,10 @@ classdef BusDrivingSystemDashboard < handle
             for k=1:9, obj.SignalAxes(k)=uiaxes(sg); title(obj.SignalAxes(k),titles(k)); grid(obj.SignalAxes(k),'on'); end
             eg=uigridlayout(events,[2 1]); eg.RowHeight={100,'1x'};
             obj.DetectorTable=uitable(eg,'ColumnName',{'Detector','State'});
-            obj.EventTable=uitable(eg,'ColumnName',{'ID','Type','Start','Duration','Peak acceleration','Peak jerk','Peak yaw','Samples','Quality','Reason'});
+            obj.EventTable=uitable(eg,'ColumnName',{'ID','Type','Start','Duration','Peak acceleration','Peak jerk','Peak yaw','Samples','Quality','Reason'}, ...
+                'CellSelectionCallback',@(~,event)obj.focusEvent(event));
             qg=uigridlayout(quality,[2 1]); obj.QualityTable=uitable(qg,'ColumnName',{'Metric','Value'});
-            qaxes=uiaxes(qg); title(qaxes,'Callback age / buffer utilization / data quality'); grid(qaxes,'on');
+            obj.QualityAxes=uiaxes(qg); title(obj.QualityAxes,'Callback age / buffer utilization / data quality / effective frequency'); grid(obj.QualityAxes,'on');
             cg=uigridlayout(calibration,[1 2]); obj.CalibrationTable=uitable(cg,'ColumnName',{'Field','Value'});
             obj.CalibrationAxes=uiaxes(cg); title(obj.CalibrationAxes,'Sensor and vehicle coordinates'); view(obj.CalibrationAxes,3); grid(obj.CalibrationAxes,'on');
             rg=uigridlayout(recording,[2 1]); rg.RowHeight={'1x',130};
@@ -141,7 +144,10 @@ classdef BusDrivingSystemDashboard < handle
             gaugeTitles={'Session size %','Duration %','Free disk reserve %'};
             for k=1:3, obj.RecordingGauges(k)=uigauge(gaugeGrid,'Limits',[0 100]); obj.RecordingGauges(k).Tooltip=gaugeTitles{k}; end
             obj.AcceptanceTable=uitable(acceptance,'ColumnName',{'Stage','State','Progress','Message'});
-            obj.LogTable=uitable(logTab,'ColumnName',{'Timestamp','Severity','Source','Stage','Type','Message'});
+            lg=uigridlayout(logTab,[2 1]); lg.RowHeight={30,'1x'};
+            obj.LogFilter=uidropdown(lg,'Items',{'All','Lifecycle','Events','Warnings','Errors','Operator'}, ...
+                'Value','All','ValueChangedFcn',@(~,~)obj.renderSafely());
+            obj.LogTable=uitable(lg,'ColumnName',{'Timestamp','Severity','Source','Stage','Type','Message'});
             controls=uigridlayout(root,[2 5]); controls.RowHeight={'1x','1x'}; controls.ColumnWidth=repmat({'1x'},1,5);
             labels={"Start system","Preflight","Start calibration","Confirm","Reject", ...
                 "Start real-time","Stop","Full acceptance","Save snapshot","Close"};
@@ -167,6 +173,7 @@ classdef BusDrivingSystemDashboard < handle
                 obj.StageLabels(k).Text=sprintf('%s %s %d%%',char(symbol),char(state),progress);
                 obj.StageLabels(k).BackgroundColor=color;
                 obj.StageLamps(k).Color=color;
+                if current==names(k), obj.StageLabels(k).Tooltip=char(string(s.message)); else, obj.StageLabels(k).Tooltip=''; end
             end
         end
         function renderOverview(obj,s)
@@ -215,6 +222,14 @@ classdef BusDrivingSystemDashboard < handle
             data=cell(numel(fields)+1,2); data(1,:)={'status',obj.displayValue(obj.qualityStatus(c))};
             for k=1:numel(fields), data(k+1,:)={fields{k},obj.field(c,fields{k},0)}; end
             obj.QualityTable.Data=data;
+            history=s.signalHistory;
+            if ~isempty(history)
+                x=obj.vector(history,'elapsedSeconds'); age=obj.vector(history,'callbackAgeMs'); quality=obj.vector(history,'dataQuality');
+                cla(obj.QualityAxes); plot(obj.QualityAxes,x,age,'DisplayName','callback age ms'); hold(obj.QualityAxes,'on');
+                plot(obj.QualityAxes,x,100*quality,'DisplayName','data quality %');
+                plot(obj.QualityAxes,x,repmat(100*c.bufferUtilization,size(x)),'DisplayName','buffer utilization %');
+                hold(obj.QualityAxes,'off'); legend(obj.QualityAxes,'show');
+            end
         end
         function renderCalibration(obj,s)
             c=s.calibration; names=fieldnames(c); data=cell(numel(names),2);
@@ -222,6 +237,14 @@ classdef BusDrivingSystemDashboard < handle
             obj.CalibrationTable.Data=data;
             cla(obj.CalibrationAxes); hold(obj.CalibrationAxes,'on');
             quiver3(obj.CalibrationAxes,0,0,0,1,0,0,'r'); quiver3(obj.CalibrationAxes,0,0,0,0,1,0,'g'); quiver3(obj.CalibrationAxes,0,0,0,0,0,1,'b');
+            if isfield(c,'rotationVehicleFromSensor') && isequal(size(c.rotationVehicleFromSensor),[3 3])
+                rotation=c.rotationVehicleFromSensor;
+                colors={'m','c','k'};
+                for axisIndex=1:3
+                    direction=rotation(axisIndex,:);
+                    quiver3(obj.CalibrationAxes,0,0,0,direction(1),direction(2),direction(3),colors{axisIndex},'LineWidth',1.5);
+                end
+            end
             hold(obj.CalibrationAxes,'off'); axis(obj.CalibrationAxes,'equal');
         end
         function renderRecording(obj,s)
@@ -241,6 +264,20 @@ classdef BusDrivingSystemDashboard < handle
         end
         function renderLog(obj,s)
             log=s.log; data=cell(numel(log),6);
+            if ~isempty(obj.LogFilter) && isvalid(obj.LogFilter) && ~strcmp(obj.LogFilter.Value,'All')
+                keep=false(numel(log),1); filter=string(obj.LogFilter.Value);
+                for index=1:numel(log)
+                    severity=upper(string(obj.field(log(index),'severity',""))); type=lower(string(obj.field(log(index),'type',"")));
+                    switch filter
+                        case "Lifecycle", keep(index)=contains(type,"lifecycle");
+                        case "Events", keep(index)=contains(type,"event");
+                        case "Warnings", keep(index)=severity=="WARNING";
+                        case "Errors", keep(index)=severity=="ERROR";
+                        case "Operator", keep(index)=string(obj.field(log(index),'source',""))=="operator";
+                    end
+                end
+                log=log(keep); data=cell(numel(log),6);
+            end
             for k=1:numel(log), data(k,:)={obj.displayValue(obj.field(log(k),'timestamp',"")),obj.displayValue(obj.field(log(k),'severity',"")), ...
                     obj.displayValue(obj.field(log(k),'source',"")),obj.displayValue(obj.field(log(k),'stage',"")), ...
                     obj.displayValue(obj.field(log(k),'type',"")),obj.displayValue(obj.field(log(k),'message',""))}; end
@@ -336,6 +373,17 @@ classdef BusDrivingSystemDashboard < handle
         function value=ratio(~,numerator,denominator)
             if isempty(denominator) || ~isfinite(double(denominator)) || denominator<=0, value=0;
             else, value=max(0,min(100,100*double(numerator)/double(denominator))); end
+        end
+        function focusEvent(obj,event)
+            if isempty(event.Indices) || size(event.Indices,1)~=1 || ...
+                    ~strcmp(obj.Figure.SelectionType,'open'), return; end
+            row=event.Indices(1); events=obj.LastSnapshot.recentEvents;
+            if row>numel(events), return; end
+            startTime=obj.field(events(row),'startElapsedSeconds',NaN);
+            duration=obj.field(events(row),'durationSeconds',1);
+            if ~isfinite(startTime), return; end
+            window=[startTime-max(1,duration),startTime+max(1,2*duration)];
+            for axisIndex=1:numel(obj.SignalAxes), xlim(obj.SignalAxes(axisIndex),window); end
         end
         function value=indicator(obj,s)
             state=string(s.lifecycleState);

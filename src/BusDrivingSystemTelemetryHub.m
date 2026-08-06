@@ -55,6 +55,11 @@ classdef BusDrivingSystemTelemetryHub < handle
             for k=1:size(map,1)
                 if isfield(status,map{k,1}), obj.Snapshot.calibration.(map{k,2})=status.(map{k,1}); end
             end
+            if isfield(status,'calibration') && isstruct(status.calibration) && ...
+                    isfield(status.calibration,'rotationVehicleFromSensor')
+                obj.Snapshot.calibration.rotationVehicleFromSensor= ...
+                    status.calibration.rotationVehicleFromSensor;
+            end
             if isfield(status,'message'), obj.Snapshot.message=string(status.message); end
         end
         function ingestMonitorStatus(obj,status)

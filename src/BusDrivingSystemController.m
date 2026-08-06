@@ -209,7 +209,11 @@ classdef BusDrivingSystemController < handle
             obj.transition(target,stage,status.progress,string(status.message));
         end
         function onCalibrationCompleted(obj,result)
-            if isfield(result,'calibration'), obj.Calibration=result.calibration; end
+            if isfield(result,'calibration')
+                obj.Calibration=result.calibration;
+                obj.TelemetryHub.ingestCalibration(struct('state',"READY",'progress',1, ...
+                    'calibration',result.calibration));
+            end
             obj.completeStage("Verification","Calibration verified.");
             obj.transition("READY","Result",1,"System ready.");
         end
