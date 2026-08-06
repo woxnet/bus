@@ -19,9 +19,11 @@ combined=struct('success',false,'generatedAt',datetime('now','TimeZone','UTC'), 
     'infrastructureFailure',false,'errors',strings(0,1), ...
     'imuBrick2Source',"",'controllerSource',"",'monitorSource',"", ...
     'imuBrick2MethodsValid',false,'controllerMethodsValid',false, ...
-    'monitorMethodsValid',false,'matlabRestartRequired',false);
+    'monitorMethodsValid',false,'matlabRestartRequired',false, ...
+    'observerWarnings',strings(0,1));
 calibrationReport=[]; runtimeReport=[]; realtimeReport=[];
 try
+    notify("stage_started","bootstrap","RUNNING",0,"Acceptance bootstrap started.",struct());
     api=dependencies.assertClassApi();
     combined=copyApiDiagnostics(combined,api);
     if combined.matlabRestartRequired
@@ -31,45 +33,61 @@ try
             'Verify the checkout commit before retrying.');
     end
     combined.checkoutCommit=string(dependencies.getCommit());
+    notify("stage_completed","bootstrap","PASSED",1,"Acceptance bootstrap complete.",api);
+    notify("stage_started","class_api","RUNNING",0,"Class API validation started.",struct());
+    notify("stage_completed","class_api","PASSED",1,"Class API validation passed.",api);
+    notify("stage_started","commit_check","RUNNING",0,"Commit check started.",struct());
+    notify("stage_completed","commit_check","PASSED",1,"Commit check passed.",struct('commit',combined.checkoutCommit));
 catch exception
     combined.infrastructureFailure=true;
     combined.matlabRestartRequired=strcmp(exception.identifier, ...
         'IMU:StaleMatlabClassDefinition');
     combined.errors(end+1,1)=formatException(exception);
+    notify("stage_failed",combined.failurePhase,"FAILED",1,exception.message,struct('identifier',exception.identifier));
     combined=saveCombined(combined,artifactDirectory);
     return;
 end
 
 try
     combined.failurePhase="installation_calibration";
+    notify("stage_started","installation_calibration","RUNNING",0,"Installation calibration started.",struct());
     calibrationReport=dependencies.runCalibration();
     verifyPhaseReport(calibrationReport,combined.checkoutCommit);
     if ~phaseSuccess(calibrationReport)
+        notify("stage_failed","installation_calibration","FAILED",1,"Installation calibration failed.",calibrationReport);
         combined=finishFailedPhase(combined,calibrationReport,artifactDirectory);
         return;
     end
+    notify("stage_completed","installation_calibration","PASSED",1,"Installation calibration passed.",calibrationReport);
 
     combined.failurePhase="runtime_fifo";
+    notify("stage_started","runtime_fifo","RUNNING",0,"Runtime FIFO acceptance started.",struct());
     runtimeReport=dependencies.runRuntime();
     verifyPhaseReport(runtimeReport,combined.checkoutCommit);
     if ~phaseSuccess(runtimeReport)
+        notify("stage_failed","runtime_fifo","FAILED",1,"Runtime FIFO acceptance failed.",runtimeReport);
         combined=attachReport(combined,'calibrationReport',calibrationReport);
         combined=finishFailedPhase(combined,runtimeReport,artifactDirectory);
         return;
     end
+    notify("stage_completed","runtime_fifo","PASSED",1,"Runtime FIFO acceptance passed.",runtimeReport);
 
     combined.failurePhase="realtime_monitor";
+    notify("stage_started","realtime_monitor","RUNNING",0,"Real-time monitor acceptance started.",struct());
     realtimeReport=dependencies.runRealtime();
     verifyPhaseReport(realtimeReport,combined.checkoutCommit);
     if ~phaseSuccess(realtimeReport)
+        notify("stage_failed","realtime_monitor","FAILED",1,"Real-time monitor acceptance failed.",realtimeReport);
         combined=attachReport(combined,'calibrationReport',calibrationReport);
         combined=attachReport(combined,'runtimeReport',runtimeReport);
         combined=finishFailedPhase(combined,realtimeReport,artifactDirectory);
         return;
     end
+    notify("stage_completed","realtime_monitor","PASSED",1,"Real-time monitor acceptance passed.",realtimeReport);
 catch exception
     combined.infrastructureFailure=true;
     combined.errors(end+1,1)=formatException(exception);
+    notify("stage_failed",combined.failurePhase,"FAILED",1,exception.message,struct('identifier',exception.identifier));
     if ~isempty(calibrationReport)
         combined=attachReport(combined,'calibrationReport',calibrationReport);
     end
@@ -85,6 +103,7 @@ end
 
 combined.failurePhase="summary_validation";
 try
+    notify("stage_started","summary_validation","RUNNING",0,"Summary validation started.",struct());
     summary=dependencies.summarize(calibrationReport,runtimeReport,realtimeReport);
     names=fieldnames(summary);
     for index=1:numel(names), combined.(names{index})=summary.(names{index}); end
@@ -100,11 +119,15 @@ try
     combined.runtimeReport=runtimeReport;
     combined.realtimeReport=realtimeReport;
     combined.failurePhase="";
+    notify("stage_completed","summary_validation","PASSED",1,"Summary validation passed.",summary);
 catch exception
     combined.success=false; combined.infrastructureFailure=true;
     combined.errors(end+1,1)=formatException(exception);
+    notify("stage_failed","summary_validation","FAILED",1,exception.message,struct('identifier',exception.identifier));
 end
+notify("stage_started","artifact_save","RUNNING",0,"Saving combined report.",struct());
 combined=saveCombined(combined,artifactDirectory);
+notify("report_saved","artifact_save","PASSED",1,"Combined report saved.",struct('matFile',combined.matFile,'jsonFile',combined.jsonFile));
 
     function dependencies=defaultDependencies()
         dependencies=struct( ...
@@ -126,6 +149,19 @@ combined=saveCombined(combined,artifactDirectory);
             error('IMU:PreflightFailed','%s',strjoin(preflight.errors," "));
         end
         report=runImuHardwareAcceptance(imu,60,artifactDirectory);
+    end
+
+    function notify(type,stage,state,progress,message,payload)
+        if ~isfield(options,'Observer') || isempty(options.Observer), return; end
+        event=struct('timestamp',datetime('now','TimeZone','UTC'),'type',string(type), ...
+            'stage',string(stage),'state',string(state),'progress',double(progress), ...
+            'message',string(message),'payload',payload);
+        try
+            options.Observer(event);
+        catch observerException
+            combined.observerWarnings(end+1,1)=string(observerException.identifier)+": "+string(observerException.message);
+            warning('IMU:AcceptanceObserverFailed','Acceptance observer failed: %s',observerException.message);
+        end
     end
 end
 

@@ -1,5 +1,8 @@
-function report = runInstallationCalibrationHardwareAcceptance()
+function report = runInstallationCalibrationHardwareAcceptance(options)
 %RUNINSTALLATIONCALIBRATIONHARDWAREACCEPTANCE Calibrate and verify one IMU.
+if nargin<1 || isempty(options), options=struct(); end
+notifyHardwareAcceptanceObserver(options,"stage_started","installation_calibration","RUNNING",0, ...
+    "Installation calibration acceptance started.",struct());
 assertImuAcceptanceClassApi();
 checkoutCommit = getImuAcceptanceCommit();
 assertImuRuntimeReady();
@@ -34,6 +37,11 @@ catch exception
     report.errors(end+1,1)=string(exception.identifier)+": "+string(exception.message);
 end
 report = savePhaseReport(report,'calibration_acceptance');
+if report.success, observerState="PASSED"; observerType="stage_completed"; else, observerState="FAILED"; observerType="stage_failed"; end
+notifyHardwareAcceptanceObserver(options,observerType,"installation_calibration",observerState,1, ...
+    "Installation calibration acceptance completed.",report);
+notifyHardwareAcceptanceObserver(options,"report_saved","artifact_save","PASSED",1, ...
+    "Calibration acceptance report saved.",struct('matFile',report.matFile,'jsonFile',report.jsonFile));
 end
 
 function report = savePhaseReport(report,prefix)

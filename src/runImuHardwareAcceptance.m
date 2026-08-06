@@ -1,14 +1,17 @@
-function report = runImuHardwareAcceptance(imu, durationSeconds, outputDirectory)
+function report = runImuHardwareAcceptance(imu, durationSeconds, outputDirectory, options)
 %RUNIMUHARDWAREACCEPTANCE Exercise FIFO callback acquisition and save a report.
 
 config = getImuConfig();
 if nargin < 2 || isempty(durationSeconds), durationSeconds = 60; end
 if nargin < 3 || isempty(outputDirectory), outputDirectory = 'artifacts'; end
+if nargin < 4 || isempty(options), options=struct(); end
 validateattributes(durationSeconds, {'numeric'}, {'scalar','positive'});
 outputDirectory = resolveProjectPath(outputDirectory);
 if ~isfolder(outputDirectory), mkdir(outputDirectory); end
 identity=imu.getIdentity(); sensorFusionMode=imu.getSensorFusionMode();
 commit=getImuAcceptanceCommit();
+notifyHardwareAcceptanceObserver(options,"stage_started","runtime_fifo","RUNNING",0, ...
+    "Runtime FIFO acceptance started.",struct());
 
 imu.start(config.callbackPeriodMs);
 streamOwner = string(imu.StreamOwner);
@@ -18,9 +21,16 @@ sequences = zeros(0, 1, 'uint64'); nanos = zeros(0, 1);
 ages = zeros(0, 1); quaternionNorms = zeros(0, 1);
 gravityMagnitudes = zeros(0, 1); temperatures = zeros(0, 1);
 timer = tic;
+lastObserverProgress=-Inf;
 while toc(timer) < durationSeconds
     consume(imu.drainCallbackSamples(256));
     pause(0.001);
+    observerProgress=min(1,toc(timer)/durationSeconds);
+    if observerProgress-lastObserverProgress>=0.05
+        notifyHardwareAcceptanceObserver(options,"stage_progress","runtime_fifo","RUNNING", ...
+            observerProgress,"Collecting FIFO samples.",struct('received',numel(sequences)));
+        lastObserverProgress=observerProgress;
+    end
 end
 imu.quiesce();
 [tailSamplesDrained, stopDrainDurationSeconds, stopDrainTimedOut] = drainTail();
@@ -83,6 +93,11 @@ report.matFile = string(base) + ".mat";
 report.jsonFile = string(base) + ".json";
 save(char(report.matFile), 'report');
 writeJson(char(report.jsonFile), report);
+if report.success, observerState="PASSED"; observerType="stage_completed"; else, observerState="FAILED"; observerType="stage_failed"; end
+notifyHardwareAcceptanceObserver(options,observerType,"runtime_fifo",observerState,1, ...
+    "Runtime FIFO acceptance completed.",report);
+notifyHardwareAcceptanceObserver(options,"report_saved","artifact_save","PASSED",1, ...
+    "Runtime FIFO report saved.",struct('matFile',report.matFile,'jsonFile',report.jsonFile));
 clear cleanup;
 
     function [count, duration, timedOut] = drainTail()

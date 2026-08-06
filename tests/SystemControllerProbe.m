@@ -1,0 +1,29 @@
+classdef SystemControllerProbe < handle
+    properties
+        HasCalibration=false
+        CalibrationStarts=0
+        CalibrationController=[]
+        Monitor=[]
+    end
+    methods
+        function dependencies=getDependencies(obj)
+            dependencies=struct('createImu',@()FakeSystemImu(), ...
+                'createCalibrationController',@(~)obj.createCalibration(), ...
+                'createRealtimeMonitor',@(~,~)obj.createMonitor(), ...
+                'runPreflight',@(~)struct('success',true,'errors',strings(0,1)), ...
+                'runAcceptance',@(~)struct('success',true), ...
+                'getCommit',@()"0123456789012345678901234567890123456789", ...
+                'nowUtc',@()datetime('now','TimeZone','UTC'), ...
+                'loadCalibration',@()obj.loadCalibration(), ...
+                'checkClassApi',@()[], 'createDashboard',@(~)[], ...
+                'createTimer',@timer,'sleep',@pause,'saveSnapshot',@(~)[]);
+        end
+        function value=loadCalibration(obj)
+            if obj.HasCalibration, value=struct('synthetic',true); else, value=[]; end
+        end
+        function value=createCalibration(obj)
+            obj.CalibrationStarts=obj.CalibrationStarts+1; value=FakeSystemCalibrationController(); obj.CalibrationController=value;
+        end
+        function value=createMonitor(obj), value=FakeSystemMonitor(); obj.Monitor=value; end
+    end
+end

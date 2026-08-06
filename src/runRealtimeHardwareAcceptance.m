@@ -1,5 +1,8 @@
-function report = runRealtimeHardwareAcceptance()
+function report = runRealtimeHardwareAcceptance(options)
 %RUNREALTIMEHARDWAREACCEPTANCE Exercise the production monitor lifecycle.
+if nargin<1 || isempty(options), options=struct(); end
+notifyHardwareAcceptanceObserver(options,"stage_started","realtime_monitor","RUNNING",0, ...
+    "Real-time monitor acceptance started.",struct());
 assertImuAcceptanceClassApi();
 checkoutCommit=getImuAcceptanceCommit();
 assertImuRuntimeReady();
@@ -48,6 +51,11 @@ report.success=preflight.success && runningAtEnd && summary.success && ...
     summary.samplesProcessed/summary.acquisitionDurationSeconds<=60 && ...
     summary.maximumCallbackAgeMs<=options.maximumSampleAgeMs;
 report=saveRealtimeReport(report,preflight,summary);
+if report.success, observerState="PASSED"; observerType="stage_completed"; else, observerState="FAILED"; observerType="stage_failed"; end
+notifyHardwareAcceptanceObserver(options,observerType,"realtime_monitor",observerState,1, ...
+    "Real-time monitor acceptance completed.",report);
+notifyHardwareAcceptanceObserver(options,"report_saved","artifact_save","PASSED",1, ...
+    "Real-time report saved.",struct('matFile',report.matFile,'jsonFile',report.jsonFile));
 end
 
 function report=saveRealtimeReport(report,preflight,summary)
