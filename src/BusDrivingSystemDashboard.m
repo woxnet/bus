@@ -8,6 +8,7 @@ classdef BusDrivingSystemDashboard < handle
         RenderCount=0
         LastRenderMilliseconds=0
         LastSnapshot=[]
+        MaximumObservedRenderMilliseconds=0
     end
     properties(Access=private)
         RenderTimer=[]
@@ -30,18 +31,28 @@ classdef BusDrivingSystemDashboard < handle
         Controls
         Closing=false
         ThresholdConfig
+        Dependencies
+        RawLines
+        FilteredLines
+        MarkerScatters
+        ThresholdLines
+        QualityLines
+        CalibrationQuivers
+        LastRenderWarningAt=NaT
     end
     methods
-        function obj=BusDrivingSystemDashboard(controller,config)
+        function obj=BusDrivingSystemDashboard(controller,config,dependencies)
             if nargin<1 || isempty(controller), error('IMU:InvalidDashboardController','Controller is required.'); end
             if nargin<2 || isempty(config), config=getBusDrivingSystemDashboardConfig(); end
+            if nargin<3, dependencies=struct(); end
             obj.Controller=controller; obj.Config=validateBusDrivingSystemDashboardConfig(config);
             obj.ThresholdConfig=getRealtimeDrivingConfig();
+            obj.Dependencies=obj.mergeDependencies(dependencies);
         end
         function open(obj)
             if ~isempty(obj.Figure) && isvalid(obj.Figure), return; end
             obj.buildUi();
-            obj.RenderTimer=timer('ExecutionMode','fixedSpacing','BusyMode','drop', ...
+            obj.RenderTimer=obj.Dependencies.createTimer('ExecutionMode','fixedSpacing','BusyMode','drop', ...
                 'Period',1/obj.Config.refreshHz,'TimerFcn',@(~,~)obj.renderSafely());
             obj.render(); start(obj.RenderTimer);
         end
@@ -53,6 +64,8 @@ classdef BusDrivingSystemDashboard < handle
             obj.renderRecording(snapshot); obj.renderAcceptance(snapshot); obj.renderLog(snapshot);
             obj.updateControls(snapshot.lifecycleState);
             obj.RenderCount=obj.RenderCount+1; obj.LastRenderMilliseconds=1000*toc(started);
+            obj.MaximumObservedRenderMilliseconds=max(obj.MaximumObservedRenderMilliseconds,obj.LastRenderMilliseconds);
+            obj.checkRenderDuration();
             drawnow limitrate;
         end
         function result=saveSnapshot(obj,directory)
@@ -62,10 +75,8 @@ classdef BusDrivingSystemDashboard < handle
             stamp=char(datetime('now','Format','yyyyMMdd_HHmmss_SSS'));
             stem=fullfile(char(directory),['system_snapshot_' stamp]);
             matFile=[stem '.mat']; jsonFile=[stem '.json'];
-            save(matFile,'snapshot','config','-v7');
-            fileId=fopen(jsonFile,'w');
-            if fileId<0, error('IMU:SystemSnapshotSaveFailed','Cannot write snapshot JSON.'); end
-            cleanup=onCleanup(@()fclose(fileId)); fprintf(fileId,'%s',jsonencode(snapshot,'PrettyPrint',true)); clear cleanup;
+            obj.Dependencies.saveMat(matFile,snapshot,config);
+            obj.Dependencies.writeJson(jsonFile,snapshot);
             pngFile=fullfile(char(directory),['system_dashboard_' stamp '.png']);
             if ~isempty(obj.Figure) && isvalid(obj.Figure)
                 resumeRender=false;
@@ -73,25 +84,30 @@ classdef BusDrivingSystemDashboard < handle
                     stop(obj.RenderTimer); resumeRender=true;
                 end
                 renderCleanup=onCleanup(@()obj.resumeRenderTimer(resumeRender));
-                if exist('exportapp','file')~=0
-                    exportapp(obj.Figure,pngFile);
-                else
-                    exportgraphics(obj.Figure,pngFile);
-                end
+                obj.Dependencies.exportPng(obj.Figure,pngFile);
                 clear renderCleanup;
             else, pngFile=""; end
             result=struct('matFile',string(matFile),'jsonFile',string(jsonFile),'pngFile',string(pngFile));
         end
-        function names=getTabNames(~)
-            names=["Overview","Signals","Events","Data quality","Calibration","Recording","Hardware acceptance","Log"];
+        function names=getTabNames(obj)
+            names=["Overview","Signals","Events","Data quality","Log"];
+            if obj.Config.enableCalibrationTab, names=[names(1:4),"Calibration",names(5)]; end
+            insertion=numel(names);
+            if obj.Config.enableRecordingTab, names=[names(1:insertion-1),"Recording",names(insertion)]; end
+            insertion=numel(names);
+            if obj.Config.enableAcceptanceTab, names=[names(1:insertion-1),"Hardware acceptance",names(insertion)]; end
+        end
+        function value=getGraphicsDiagnostics(obj)
+            value=struct('rawLines',obj.RawLines,'filteredLines',obj.FilteredLines, ...
+                'markerScatters',obj.MarkerScatters,'thresholdLines',obj.ThresholdLines, ...
+                'qualityLines',obj.QualityLines,'maximumRenderedPointsPerSeries',obj.Config.maximumRenderedPointsPerSeries);
         end
         function close(obj)
             if obj.Closing, return; end
             obj.Closing=true; cleanup=onCleanup(@()obj.resetClosing());
             obj.stopTimer();
             if obj.Config.closeStopsSystem
-                status=obj.Controller.getStatus();
-                if status.isRealtimeRunning, obj.Controller.stopRealtime(); end
+                obj.Controller.close();
             end
             if ~isempty(obj.Figure) && isvalid(obj.Figure)
                 obj.Figure.CloseRequestFcn=[]; delete(obj.Figure);
@@ -121,29 +137,67 @@ classdef BusDrivingSystemDashboard < handle
             end
             tabs=uitabgroup(root); overview=uitab(tabs,'Title','Overview'); signals=uitab(tabs,'Title','Signals');
             events=uitab(tabs,'Title','Events'); quality=uitab(tabs,'Title','Data quality');
-            calibration=uitab(tabs,'Title','Calibration'); recording=uitab(tabs,'Title','Recording');
-            acceptance=uitab(tabs,'Title','Hardware acceptance'); logTab=uitab(tabs,'Title','Log');
+            if obj.Config.enableCalibrationTab, calibration=uitab(tabs,'Title','Calibration'); else, calibration=[]; end
+            if obj.Config.enableRecordingTab, recording=uitab(tabs,'Title','Recording'); else, recording=[]; end
+            if obj.Config.enableAcceptanceTab, acceptance=uitab(tabs,'Title','Hardware acceptance'); else, acceptance=[]; end
+            logTab=uitab(tabs,'Title','Log');
             og=uigridlayout(overview,[2 1]); og.RowHeight={55,'1x'};
             obj.StatusLabel=uilabel(og,'Text','SYSTEM IDLE','FontSize',24,'FontWeight','bold','HorizontalAlignment','center');
             obj.OverviewTable=uitable(og,'ColumnName',{'Field','Value'},'ColumnEditable',[false false]);
-            sg=uigridlayout(signals,[3 3]); obj.SignalAxes=gobjects(9,1);
+            signalRoot=uigridlayout(signals,[2 1]); signalRoot.RowHeight={30,'1x'};
+            toggles=uigridlayout(signalRoot,[1 4]); toggles.ColumnWidth={'1x','1x','1x','1x'};
+            uicheckbox(toggles,'Text','Raw','Value',obj.Config.showRawSignals, ...
+                'ValueChangedFcn',@(source,~)obj.setDisplayOption('showRawSignals',source.Value));
+            uicheckbox(toggles,'Text','Filtered','Value',obj.Config.showFilteredSignals, ...
+                'ValueChangedFcn',@(source,~)obj.setDisplayOption('showFilteredSignals',source.Value));
+            uicheckbox(toggles,'Text','Thresholds','Value',obj.Config.showThresholds, ...
+                'ValueChangedFcn',@(source,~)obj.setDisplayOption('showThresholds',source.Value));
+            uicheckbox(toggles,'Text','Event markers','Value',obj.Config.showEventMarkers, ...
+                'ValueChangedFcn',@(source,~)obj.setDisplayOption('showEventMarkers',source.Value));
+            sg=uigridlayout(signalRoot,[3 3]); obj.SignalAxes=gobjects(9,1);
             titles=["Longitudinal acceleration","Lateral acceleration","Vertical acceleration", ...
                 "Yaw rate","Longitudinal jerk","Lateral jerk","Vertical jerk","Data quality","Callback age"];
-            for k=1:9, obj.SignalAxes(k)=uiaxes(sg); title(obj.SignalAxes(k),titles(k)); grid(obj.SignalAxes(k),'on'); end
+            obj.RawLines=gobjects(9,1); obj.FilteredLines=gobjects(9,1); obj.MarkerScatters=gobjects(9,1);
+            obj.ThresholdLines=gobjects(9,4);
+            for k=1:9
+                ax=uiaxes(sg); obj.SignalAxes(k)=ax; title(ax,titles(k)); grid(ax,'on'); hold(ax,'on');
+                obj.RawLines(k)=plot(ax,nan,nan,'Color',[.65 .65 .65],'DisplayName','raw');
+                obj.FilteredLines(k)=plot(ax,nan,nan,'Color',[0 .35 .75],'LineWidth',1.2,'DisplayName','filtered');
+                obj.MarkerScatters(k)=scatter(ax,nan,nan,28,'filled','MarkerFaceColor',[.85 .2 .2],'HandleVisibility','off');
+                values=obj.thresholdValues(k);
+                for thresholdIndex=1:4
+                    thresholdValue=NaN; if thresholdIndex<=numel(values), thresholdValue=values(thresholdIndex); end
+                    obj.ThresholdLines(k,thresholdIndex)=yline(ax,thresholdValue,':','Color',[.45 .45 .45],'HandleVisibility','off');
+                end
+                hold(ax,'off');
+            end
             eg=uigridlayout(events,[2 1]); eg.RowHeight={100,'1x'};
             obj.DetectorTable=uitable(eg,'ColumnName',{'Detector','State'});
             obj.EventTable=uitable(eg,'ColumnName',{'ID','Type','Start','Duration','Peak acceleration','Peak jerk','Peak yaw','Samples','Quality','Reason'}, ...
                 'CellSelectionCallback',@(~,event)obj.focusEvent(event));
             qg=uigridlayout(quality,[2 1]); obj.QualityTable=uitable(qg,'ColumnName',{'Metric','Value'});
             obj.QualityAxes=uiaxes(qg); title(obj.QualityAxes,'Callback age / buffer utilization / data quality / effective frequency'); grid(obj.QualityAxes,'on');
-            cg=uigridlayout(calibration,[1 2]); obj.CalibrationTable=uitable(cg,'ColumnName',{'Field','Value'});
-            obj.CalibrationAxes=uiaxes(cg); title(obj.CalibrationAxes,'Sensor and vehicle coordinates'); view(obj.CalibrationAxes,3); grid(obj.CalibrationAxes,'on');
-            rg=uigridlayout(recording,[2 1]); rg.RowHeight={'1x',130};
-            obj.RecordingTable=uitable(rg,'ColumnName',{'Field','Value'});
-            gaugeGrid=uigridlayout(rg,[1 3]); obj.RecordingGauges=gobjects(3,1);
-            gaugeTitles={'Session size %','Duration %','Free disk reserve %'};
-            for k=1:3, obj.RecordingGauges(k)=uigauge(gaugeGrid,'Limits',[0 100]); obj.RecordingGauges(k).Tooltip=gaugeTitles{k}; end
-            obj.AcceptanceTable=uitable(acceptance,'ColumnName',{'Stage','State','Progress','Message'});
+            hold(obj.QualityAxes,'on'); obj.QualityLines=gobjects(4,1);
+            qualityNames={'callback age ms','data quality %','buffer utilization %','effective frequency Hz'};
+            for k=1:4, obj.QualityLines(k)=plot(obj.QualityAxes,nan,nan,'DisplayName',qualityNames{k}); end
+            hold(obj.QualityAxes,'off'); legend(obj.QualityAxes,'show');
+            if obj.Config.enableCalibrationTab
+                cg=uigridlayout(calibration,[1 2]); obj.CalibrationTable=uitable(cg,'ColumnName',{'Field','Value'});
+                obj.CalibrationAxes=uiaxes(cg); title(obj.CalibrationAxes,'Sensor and vehicle coordinates'); view(obj.CalibrationAxes,3); grid(obj.CalibrationAxes,'on');
+                hold(obj.CalibrationAxes,'on'); obj.CalibrationQuivers=gobjects(6,1); colors={'r','g','b','m','c','k'};
+                for k=1:6, obj.CalibrationQuivers(k)=quiver3(obj.CalibrationAxes,0,0,0,0,0,0,colors{k},'LineWidth',1.5); end
+                hold(obj.CalibrationAxes,'off'); axis(obj.CalibrationAxes,'equal');
+            end
+            if obj.Config.enableRecordingTab
+                rg=uigridlayout(recording,[2 1]); rg.RowHeight={'1x',130};
+                obj.RecordingTable=uitable(rg,'ColumnName',{'Field','Value'});
+                gaugeGrid=uigridlayout(rg,[1 3]); obj.RecordingGauges=gobjects(3,1);
+                gaugeTitles={'Session size %','Duration %','Free disk reserve %'};
+                for k=1:3, obj.RecordingGauges(k)=uigauge(gaugeGrid,'Limits',[0 100]); obj.RecordingGauges(k).Tooltip=gaugeTitles{k}; end
+            end
+            if obj.Config.enableAcceptanceTab
+                obj.AcceptanceTable=uitable(acceptance,'ColumnName',{'Stage','State','Progress','Message'});
+            end
             lg=uigridlayout(logTab,[2 1]); lg.RowHeight={30,'1x'};
             obj.LogFilter=uidropdown(lg,'Items',{'All','Lifecycle','Events','Warnings','Errors','Operator'}, ...
                 'Value','All','ValueChangedFcn',@(~,~)obj.renderSafely());
@@ -161,7 +215,7 @@ classdef BusDrivingSystemDashboard < handle
         end
         function renderPipeline(obj,s)
             names=["Bootstrap","Class API","IMU","Preflight","Calibration","Verification","Realtime","Recording","Stopping","Result"];
-            completed=obj.completedStages(s); current=string(s.currentStage);
+            completed=obj.completedStages(s); rawCurrent=string(s.currentStage); current=obj.pipelineStageName(rawCurrent);
             for k=1:numel(names)
                 state="NOT_STARTED"; symbol="—"; color=[.94 .94 .94]; progress=0;
                 if any(completed==names(k)), state="PASSED"; symbol="✓"; color=[.82 .94 .82]; progress=100; end
@@ -170,7 +224,9 @@ classdef BusDrivingSystemDashboard < handle
                     if string(s.lifecycleState)=="CALIBRATION_REQUIRED", state="WAITING_OPERATOR"; symbol="!"; color=[1 .93 .72]; end
                     if string(s.lifecycleState)=="FAILED", state="FAILED"; symbol="✕"; color=[1 .78 .78]; end
                 end
-                obj.StageLabels(k).Text=sprintf('%s %s %d%%',char(symbol),char(state),progress);
+                elapsed=obj.stageElapsed(s,names(k));
+                if current==names(k), elapsed=obj.stageElapsed(s,rawCurrent); end
+                obj.StageLabels(k).Text=sprintf('%s %s %d%% %.1fs',char(symbol),char(state),progress,elapsed);
                 obj.StageLabels(k).BackgroundColor=color;
                 obj.StageLamps(k).Color=color;
                 if current==names(k), obj.StageLabels(k).Tooltip=char(string(s.message)); else, obj.StageLabels(k).Tooltip=''; end
@@ -178,11 +234,11 @@ classdef BusDrivingSystemDashboard < handle
         end
         function renderOverview(obj,s)
             indicator=obj.indicator(s); obj.StatusLabel.Text=char(indicator);
-            obj.OverviewTable.Data={'Lifecycle',obj.displayValue(s.lifecycleState);'Current stage',obj.displayValue(s.currentStage); ...
+            obj.setTableData(obj.OverviewTable,{'Lifecycle',obj.displayValue(s.lifecycleState);'Current stage',obj.displayValue(s.currentStage); ...
                 'Mode',obj.displayValue(s.mode);'Bus ID',obj.displayValue(s.busId);'IMU UID',obj.displayValue(s.imuUid); ...
                 'Firmware',mat2str(s.firmwareVersion);'Sensor fusion',mat2str(s.sensorFusionMode); ...
                 'Commit',obj.displayValue(s.checkoutCommit);'Stream owner',obj.displayValue(obj.field(s.realtime,'streamOwner',"none")); ...
-                'Recorder',obj.displayValue(obj.field(s.recording,'status',"disabled"));'Last error',obj.displayValue(obj.lastError(s))};
+                'Recorder',obj.displayValue(obj.field(s.recording,'status',"disabled"));'Last error',obj.displayValue(obj.lastError(s))});
         end
         function renderSignals(obj,s)
             history=s.signalHistory; if isempty(history), return; end
@@ -190,30 +246,38 @@ classdef BusDrivingSystemDashboard < handle
                 {'lateralRaw','lateralFiltered'},{'verticalRaw','verticalFiltered'}, ...
                 {'yawRateRaw','yawRateFiltered'},{'longitudinalJerk'},{'lateralJerk'}, ...
                 {'verticalJerk'},{'dataQuality'},{'callbackAgeMs'}};
+            indices=obj.decimationIndices(numel(x)); renderedX=x(indices);
             for k=1:9
-                cla(obj.SignalAxes(k)); hold(obj.SignalAxes(k),'on');
-                for n=1:numel(fields{k})
-                    if n==1 && ~obj.Config.showRawSignals && numel(fields{k})>1, continue; end
-                    if n==2 && ~obj.Config.showFilteredSignals, continue; end
-                    plot(obj.SignalAxes(k),x,obj.vector(history,fields{k}{n}),'DisplayName',fields{k}{n});
+                if numel(fields{k})>1
+                    raw=obj.vector(history,fields{k}{1}); filtered=obj.vector(history,fields{k}{2});
+                    obj.setSeries(obj.RawLines(k),renderedX,raw(indices),obj.Config.showRawSignals);
+                    obj.setSeries(obj.FilteredLines(k),renderedX,filtered(indices),obj.Config.showFilteredSignals);
+                else
+                    filtered=obj.vector(history,fields{k}{1});
+                    obj.setSeries(obj.RawLines(k),[],[],false);
+                    obj.setSeries(obj.FilteredLines(k),renderedX,filtered(indices),obj.Config.showFilteredSignals);
                 end
                 obj.renderThresholds(k);
-                if obj.Config.showEventMarkers, obj.renderEventMarkers(obj.SignalAxes(k),s,x,history,fields{k}{end}); end
-                hold(obj.SignalAxes(k),'off');
+                obj.renderEventMarkers(k,s,x,history,fields{k}{end});
+                if obj.Config.autoScaleSignals
+                    obj.SignalAxes(k).XLimMode='auto'; obj.SignalAxes(k).YLimMode='auto';
+                elseif strcmp(obj.SignalAxes(k).YLimMode,'auto')
+                    limits=ylim(obj.SignalAxes(k)); obj.SignalAxes(k).YLim=limits;
+                end
             end
         end
         function renderEvents(obj,s)
             types=["BRAKING_CANDIDATE","ACCELERATION_CANDIDATE","TURN_LEFT_CANDIDATE","TURN_RIGHT_CANDIDATE","VERTICAL_SHOCK_CANDIDATE"];
             states=repmat("IDLE",5,1);
             for k=1:numel(s.activeEvents), if isfield(s.activeEvents(k),'type'), states(types==string(s.activeEvents(k).type))="ACTIVE"; end, end
-            obj.DetectorTable.Data=[cellstr(types(:)),cellstr(states(:))];
+            obj.setTableData(obj.DetectorTable,[cellstr(types(:)),cellstr(states(:))]);
             e=s.recentEvents; data=cell(numel(e),10);
             for k=1:numel(e), data(k,:)={obj.displayValue(obj.field(e(k),'eventId',"")),obj.displayValue(obj.field(e(k),'type',"")), ...
                     obj.displayValue(obj.field(e(k),'startTimestamp',"")),obj.field(e(k),'durationSeconds',NaN), ...
                     obj.field(e(k),'peakAcceleration',NaN),obj.field(e(k),'peakJerk',NaN), ...
                     obj.field(e(k),'peakYawRate',NaN),obj.field(e(k),'sampleCount',0), ...
                     obj.field(e(k),'dataQuality',NaN),obj.displayValue(obj.field(e(k),'terminationReason',""))}; end
-            obj.EventTable.Data=data;
+            obj.setTableData(obj.EventTable,data);
         end
         function renderQuality(obj,s)
             c=s.callback; fields={'averageFrequencyHz','currentCallbackAgeMs','maximumCallbackAgeMs','bufferUtilization', ...
@@ -221,46 +285,54 @@ classdef BusDrivingSystemDashboard < handle
                 'overflowDropped','coalesced','staleSessionDropped'};
             data=cell(numel(fields)+1,2); data(1,:)={'status',obj.displayValue(obj.qualityStatus(c))};
             for k=1:numel(fields), data(k+1,:)={fields{k},obj.field(c,fields{k},0)}; end
-            obj.QualityTable.Data=data;
+            obj.setTableData(obj.QualityTable,data);
             history=s.signalHistory;
             if ~isempty(history)
                 x=obj.vector(history,'elapsedSeconds'); age=obj.vector(history,'callbackAgeMs'); quality=obj.vector(history,'dataQuality');
-                cla(obj.QualityAxes); plot(obj.QualityAxes,x,age,'DisplayName','callback age ms'); hold(obj.QualityAxes,'on');
-                plot(obj.QualityAxes,x,100*quality,'DisplayName','data quality %');
-                plot(obj.QualityAxes,x,repmat(100*c.bufferUtilization,size(x)),'DisplayName','buffer utilization %');
-                hold(obj.QualityAxes,'off'); legend(obj.QualityAxes,'show');
+                indices=obj.decimationIndices(numel(x)); x=x(indices); age=age(indices); quality=quality(indices);
+                frequency=obj.vector(history,'effectiveFrequencyHz');
+                obj.setSeries(obj.QualityLines(1),x,age,true);
+                obj.setSeries(obj.QualityLines(2),x,100*quality,true);
+                obj.setSeries(obj.QualityLines(3),x,repmat(100*c.bufferUtilization,size(x)),true);
+                obj.setSeries(obj.QualityLines(4),x,frequency(indices),true);
             end
         end
         function renderCalibration(obj,s)
+            if ~obj.Config.enableCalibrationTab || isempty(obj.CalibrationTable), return; end
             c=s.calibration; names=fieldnames(c); data=cell(numel(names),2);
             for k=1:numel(names), data(k,:)={names{k},obj.displayValue(c.(names{k}))}; end
-            obj.CalibrationTable.Data=data;
-            cla(obj.CalibrationAxes); hold(obj.CalibrationAxes,'on');
-            quiver3(obj.CalibrationAxes,0,0,0,1,0,0,'r'); quiver3(obj.CalibrationAxes,0,0,0,0,1,0,'g'); quiver3(obj.CalibrationAxes,0,0,0,0,0,1,'b');
+            obj.setTableData(obj.CalibrationTable,data);
+            directions=[eye(3);zeros(3)];
             if isfield(c,'rotationVehicleFromSensor') && isequal(size(c.rotationVehicleFromSensor),[3 3])
-                rotation=c.rotationVehicleFromSensor;
-                colors={'m','c','k'};
-                for axisIndex=1:3
-                    direction=rotation(axisIndex,:);
-                    quiver3(obj.CalibrationAxes,0,0,0,direction(1),direction(2),direction(3),colors{axisIndex},'LineWidth',1.5);
-                end
+                directions(4:6,:)=c.rotationVehicleFromSensor;
             end
-            hold(obj.CalibrationAxes,'off'); axis(obj.CalibrationAxes,'equal');
+            for axisIndex=1:6
+                direction=directions(axisIndex,:); q=obj.CalibrationQuivers(axisIndex);
+                q.UData=direction(1); q.VData=direction(2); q.WData=direction(3);
+            end
         end
         function renderRecording(obj,s)
+            if ~obj.Config.enableRecordingTab || isempty(obj.RecordingTable), return; end
             r=s.recording; names=fieldnames(r); data=cell(numel(names),2);
             for k=1:numel(names), data(k,:)={names{k},obj.displayValue(r.(names{k}))}; end
-            obj.RecordingTable.Data=data;
+            obj.setTableData(obj.RecordingTable,data);
             sizeRatio=obj.ratio(obj.field(r,'bytesWritten',0)+obj.field(r,'estimatedBufferedBytes',0),obj.field(r,'maximumSessionBytes',0));
             durationRatio=obj.ratio(obj.field(r,'durationSeconds',0),obj.field(r,'maximumDurationSeconds',0));
             freeRatio=obj.ratio(obj.field(r,'freeDiskBytes',0),obj.field(r,'minimumFreeDiskBytes',0));
             obj.RecordingGauges(1).Value=sizeRatio; obj.RecordingGauges(2).Value=durationRatio; obj.RecordingGauges(3).Value=freeRatio;
         end
         function renderAcceptance(obj,s)
+            if ~obj.Config.enableAcceptanceTab || isempty(obj.AcceptanceTable), return; end
             stages=s.stageHistory; data=cell(numel(stages),4);
             for k=1:numel(stages), data(k,:)={obj.displayValue(obj.field(stages(k),'stage',"")),obj.displayValue(obj.field(stages(k),'state',"")), ...
                     obj.field(stages(k),'progress',0),obj.displayValue(obj.field(stages(k),'message',""))}; end
-            obj.AcceptanceTable.Data=data;
+            summary=s.acceptance;
+            if isstruct(summary)
+                names=fieldnames(summary); summaryData=cell(numel(names),4);
+                for k=1:numel(names), summaryData(k,:)={['Summary.' names{k}],'',[],obj.displayValue(summary.(names{k}))}; end
+                data=[data;summaryData];
+            end
+            obj.setTableData(obj.AcceptanceTable,data);
         end
         function renderLog(obj,s)
             log=s.log; data=cell(numel(log),6);
@@ -281,7 +353,7 @@ classdef BusDrivingSystemDashboard < handle
             for k=1:numel(log), data(k,:)={obj.displayValue(obj.field(log(k),'timestamp',"")),obj.displayValue(obj.field(log(k),'severity',"")), ...
                     obj.displayValue(obj.field(log(k),'source',"")),obj.displayValue(obj.field(log(k),'stage',"")), ...
                     obj.displayValue(obj.field(log(k),'type',"")),obj.displayValue(obj.field(log(k),'message',""))}; end
-            obj.LogTable.Data=data;
+            obj.setTableData(obj.LogTable,data);
         end
         function updateControls(obj,state)
             state=string(state); enabled=false(10,1);
@@ -306,6 +378,30 @@ classdef BusDrivingSystemDashboard < handle
         function resetClosing(obj), obj.Closing=false; end
         function handleCloseRequest(obj)
             status=obj.Controller.getStatus();
+            if ~usejava('desktop') && (obj.field(status,'isAcceptanceRunning',false) || ...
+                    obj.field(status,'isCalibrationRunning',false) || obj.field(status,'isRealtimeRunning',false))
+                return;
+            end
+            if obj.field(status,'isAcceptanceRunning',false)
+                choice=uiconfirm(obj.Figure,'Hardware acceptance is active and cannot be cancelled safely.', ...
+                    'Close dashboard','Options',{'Leave acceptance running','Cancel close'}, ...
+                    'DefaultOption',2,'CancelOption',2);
+                if strcmp(choice,'Cancel close'), return; end
+                previous=obj.Config.closeStopsSystem; obj.Config.closeStopsSystem=false;
+                cleanup=onCleanup(@()obj.restoreCloseOption(previous)); obj.close(); clear cleanup;
+                return;
+            end
+            if obj.field(status,'isCalibrationRunning',false)
+                choice=uiconfirm(obj.Figure,'Calibration is active.', ...
+                    'Close dashboard','Options',{'Cancel calibration and close','Leave calibration running','Cancel'}, ...
+                    'DefaultOption',1,'CancelOption',3);
+                if strcmp(choice,'Cancel'), return; end
+                if strcmp(choice,'Leave calibration running')
+                    previous=obj.Config.closeStopsSystem; obj.Config.closeStopsSystem=false;
+                    cleanup=onCleanup(@()obj.restoreCloseOption(previous)); obj.close(); clear cleanup;
+                    return;
+                end
+            end
             if status.isRealtimeRunning
                 choice=uiconfirm(obj.Figure,'Real-time monitoring is active.', ...
                     'Close dashboard','Options',{'Stop system and close','Leave system running','Cancel'}, ...
@@ -347,8 +443,33 @@ classdef BusDrivingSystemDashboard < handle
             else, result="GOOD"; end
         end
         function renderThresholds(obj,index)
-            if ~obj.Config.showThresholds, return; end
-            t=obj.ThresholdConfig; ax=obj.SignalAxes(index);
+            values=obj.thresholdValues(index);
+            for thresholdIndex=1:4
+                visible=obj.Config.showThresholds && thresholdIndex<=numel(values);
+                if visible
+                    obj.ThresholdLines(index,thresholdIndex).Value=values(thresholdIndex);
+                    obj.ThresholdLines(index,thresholdIndex).Visible='on';
+                else
+                    obj.ThresholdLines(index,thresholdIndex).Visible='off';
+                end
+            end
+        end
+        function renderEventMarkers(obj,index,s,x,history,fieldName)
+            handle=obj.MarkerScatters(index);
+            if ~obj.Config.showEventMarkers || isempty(x) || isempty(s.recentEvents)
+                obj.setSeries(handle,[],[],false); return;
+            end
+            markerX=[];
+            for k=1:numel(s.recentEvents)
+                value=obj.field(s.recentEvents(k),'startElapsedSeconds',NaN);
+                if isfinite(value) && value>=x(1) && value<=x(end), markerX(end+1)=value; end %#ok<AGROW>
+            end
+            if isempty(markerX), obj.setSeries(handle,[],[],false); return; end
+            y=obj.vector(history,fieldName); markerY=interp1(x,y,markerX,'nearest','extrap');
+            obj.setSeries(handle,markerX,markerY,true);
+        end
+        function values=thresholdValues(obj,index)
+            t=obj.ThresholdConfig;
             switch index
                 case 1, values=[t.brakingStartThreshold,t.brakingStopThreshold,t.accelerationStartThreshold,t.accelerationStopThreshold];
                 case 2, values=[-t.lateralStartThreshold,-t.lateralStopThreshold,t.lateralStopThreshold,t.lateralStartThreshold];
@@ -357,18 +478,55 @@ classdef BusDrivingSystemDashboard < handle
                 case {5,6,7}, values=[-t.jerkCandidateThreshold,t.jerkCandidateThreshold];
                 otherwise, values=[];
             end
-            for value=values, yline(ax,value,':','Color',[.45 .45 .45],'HandleVisibility','off'); end
         end
-        function renderEventMarkers(obj,ax,s,x,history,fieldName)
-            if isempty(x) || isempty(s.recentEvents), return; end
-            markerX=[];
-            for k=1:numel(s.recentEvents)
-                value=obj.field(s.recentEvents(k),'startElapsedSeconds',NaN);
-                if isfinite(value) && value>=x(1) && value<=x(end), markerX(end+1)=value; end %#ok<AGROW>
+        function indices=decimationIndices(obj,count)
+            maximum=obj.Config.maximumRenderedPointsPerSeries;
+            if count<=maximum, indices=1:count; return; end
+            indices=unique(round(linspace(1,count,maximum)));
+        end
+        function setSeries(~,handle,x,y,visible)
+            handle.XData=x; handle.YData=y;
+            if visible, handle.Visible='on'; else, handle.Visible='off'; end
+        end
+        function setTableData(~,handle,data)
+            if ~isequaln(handle.Data,data), handle.Data=data; end
+        end
+        function setDisplayOption(obj,name,value)
+            obj.Config.(name)=logical(value); obj.renderSafely();
+        end
+        function elapsed=stageElapsed(obj,s,name)
+            elapsed=0; stages=s.stageHistory;
+            for index=numel(stages):-1:1
+                if string(obj.field(stages(index),'stage',""))==name
+                    elapsed=double(obj.field(stages(index),'elapsedSeconds',0)); return;
+                end
             end
-            if isempty(markerX), return; end
-            y=obj.vector(history,fieldName); markerY=interp1(x,y,markerX,'nearest','extrap');
-            scatter(ax,markerX,markerY,28,'filled','MarkerFaceColor',[.85 .2 .2],'HandleVisibility','off');
+        end
+        function checkRenderDuration(obj)
+            if obj.LastRenderMilliseconds<=obj.Config.maximumRenderMilliseconds, return; end
+            nowValue=obj.Dependencies.nowUtc();
+            if ~isnat(obj.LastRenderWarningAt) && seconds(nowValue-obj.LastRenderWarningAt)<10, return; end
+            obj.LastRenderWarningAt=nowValue;
+            message=sprintf('Dashboard render took %.1f ms (limit %.1f ms).', ...
+                obj.LastRenderMilliseconds,obj.Config.maximumRenderMilliseconds);
+            warning('IMU:SystemDashboardSlowRender','%s',message);
+            try
+                obj.Controller.TelemetryHub.ingestWarning(struct('identifier',"IMU:SystemDashboardSlowRender", ...
+                    'message',string(message),'renderMilliseconds',obj.LastRenderMilliseconds));
+            catch
+            end
+        end
+        function dependencies=mergeDependencies(~,custom)
+            defaults=struct('createTimer',@timer,'nowUtc',@()datetime('now','TimeZone','UTC'), ...
+                'exportPng',@exportDashboardPng, ...
+                'writeJson',@writeDashboardJson,'saveMat',@saveDashboardMat);
+            if ~isstruct(custom) || ~isscalar(custom)
+                error('IMU:InvalidDashboardDependencies','Dashboard dependencies must be a scalar struct.');
+            end
+            unknown=setdiff(fieldnames(custom),fieldnames(defaults));
+            if ~isempty(unknown), error('IMU:InvalidDashboardDependencies','Unknown dependency: %s.',unknown{1}); end
+            dependencies=defaults; names=fieldnames(custom);
+            for index=1:numel(names), dependencies.(names{index})=custom.(names{index}); end
         end
         function value=ratio(~,numerator,denominator)
             if isempty(denominator) || ~isfinite(double(denominator)) || denominator<=0, value=0;
@@ -388,13 +546,45 @@ classdef BusDrivingSystemDashboard < handle
         function value=indicator(obj,s)
             state=string(s.lifecycleState);
             if state=="FAILED", value="FAILED"; elseif state=="CALIBRATION_REQUIRED", value="CALIBRATION REQUIRED";
-            elseif any(state==["STOP_REQUESTED","QUIESCING","DRAINING_TAIL","FINALIZING_RECORDING","RELEASING_STREAM"]), value="STOPPING";
+            elseif any(state==["STOP_REQUESTED","STOP_DEFERRED","STOPPING","QUIESCING","DRAINING_TAIL", ...
+                    "FINAL_STATS","FINALIZING_EVENTS","FINALIZING_RECORDING","CLEARING_BUFFER","RELEASING_OWNER"]), value="STOPPING";
             elseif state=="STREAMING" && obj.qualityStatus(s.callback)~="GOOD", value="DEGRADED DATA";
             elseif state=="STREAMING", value="STREAMING"; elseif state=="READY", value="SYSTEM READY"; else, value="SYSTEM "+state; end
         end
-        function completed=completedStages(~,s)
+        function completed=completedStages(obj,s)
             completed=strings(0,1); stages=s.stageHistory;
-            for k=1:numel(stages), if isfield(stages(k),'state') && string(stages(k).state)=="PASSED", completed(end+1,1)=string(stages(k).stage); end, end
+            for k=1:numel(stages)
+                if isfield(stages(k),'state') && string(stages(k).state)=="PASSED"
+                    completed(end+1,1)=obj.pipelineStageName(string(stages(k).stage));
+                end
+            end
+        end
+        function value=pipelineStageName(~,value)
+            switch lower(string(value))
+                case "bootstrap", value="Bootstrap";
+                case "class_api", value="Class API";
+                case "commit_check", value="IMU";
+                case "installation_calibration", value="Calibration";
+                case {"runtime_fifo","realtime_monitor"}, value="Realtime";
+                case "summary_validation", value="Result";
+                case "artifact_save", value="Result";
+            end
         end
     end
+end
+
+function writeDashboardJson(filename,value)
+fileId=fopen(filename,'w');
+if fileId<0, error('IMU:SnapshotWriteFailed','Unable to open %s.',filename); end
+cleanup=onCleanup(@()fclose(fileId));
+fprintf(fileId,'%s',jsonencode(value,'PrettyPrint',true));
+clear cleanup;
+end
+
+function saveDashboardMat(filename,snapshot,config)
+save(filename,'snapshot','config','-v7');
+end
+
+function exportDashboardPng(figureHandle,filename)
+exportapp(figureHandle,filename);
 end

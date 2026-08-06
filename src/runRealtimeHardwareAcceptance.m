@@ -1,8 +1,9 @@
-function report = runRealtimeHardwareAcceptance(options)
+function report = runRealtimeHardwareAcceptance(acceptanceOptions)
 %RUNREALTIMEHARDWAREACCEPTANCE Exercise the production monitor lifecycle.
-if nargin<1 || isempty(options), options=struct(); end
-notifyHardwareAcceptanceObserver(options,"stage_started","realtime_monitor","RUNNING",0, ...
-    "Real-time monitor acceptance started.",struct());
+if nargin<1 || isempty(acceptanceOptions), acceptanceOptions=struct(); end
+observerWarnings=strings(0,1);
+capture(notifyHardwareAcceptanceObserver(acceptanceOptions,"stage_started","realtime_monitor","RUNNING",0, ...
+    "Real-time monitor acceptance started.",struct()));
 assertImuAcceptanceClassApi();
 checkoutCommit=getImuAcceptanceCommit();
 assertImuRuntimeReady();
@@ -16,11 +17,21 @@ preflight=diagnoseImuBrick2UsingExistingConnection(imu);
 if ~preflight.success
     error('IMU:PreflightFailed','%s',strjoin(preflight.errors," "));
 end
-options=getRealtimeDrivingConfig();
-options.enableLivePlot=false; options.enableRecording=false; options.UseTimer=true;
-monitor=RealtimeDrivingMonitor(imu,calibration,options);
+monitorOptions=getRealtimeDrivingConfig();
+monitorOptions.enableLivePlot=false; monitorOptions.enableRecording=false; monitorOptions.UseTimer=true;
+monitor=RealtimeDrivingMonitor(imu,calibration,monitorOptions);
 monitorCleanup=onCleanup(@()delete(monitor));
-monitor.start(); pause(120); runningAtEnd=monitor.IsRunning; summary=monitor.stop();
+monitor.start(); acceptanceDurationSeconds=120; acceptanceTimer=tic; lastProgress=-Inf;
+while toc(acceptanceTimer)<acceptanceDurationSeconds
+    pause(0.1); progress=min(1,toc(acceptanceTimer)/acceptanceDurationSeconds);
+    if progress-lastProgress>=0.05
+        capture(notifyHardwareAcceptanceObserver(acceptanceOptions,"stage_progress", ...
+            "realtime_monitor","RUNNING",progress,"Real-time monitor running.", ...
+            struct('elapsedSeconds',toc(acceptanceTimer))));
+        lastProgress=progress;
+    end
+end
+runningAtEnd=monitor.IsRunning; summary=monitor.stop();
 report=struct('commit',checkoutCommit,'matlabVersion',string(version), ...
     'javaVersion',string(version('-java')),'uid',string(preflight.uid), ...
     'busId',imuConfig.busId,'firmwareVersion',preflight.firmwareVersion, ...
@@ -36,7 +47,7 @@ report=struct('commit',checkoutCommit,'matlabVersion',string(version), ...
     'maximumCallbackAgeMs',summary.maximumCallbackAgeMs, ...
     'tailSamplesDrained',summary.tailSamplesDrained, ...
     'stopDrainDurationSeconds',summary.stopDrainDurationSeconds, ...
-    'stopDrainPollIntervalSeconds',options.stopDrainPollIntervalSeconds, ...
+    'stopDrainPollIntervalSeconds',monitorOptions.stopDrainPollIntervalSeconds, ...
     'stopDrainTimedOut',summary.stopDrainTimedOut, ...
     'finalCallbackStats',summary.finalCallbackStats, ...
     'monitorRunningAtEnd',runningAtEnd,'summarySuccess',summary.success, ...
@@ -49,13 +60,27 @@ report.success=preflight.success && runningAtEnd && summary.success && ...
     summary.acquisitionDurationSeconds>0 && ...
     summary.samplesProcessed/summary.acquisitionDurationSeconds>=40 && ...
     summary.samplesProcessed/summary.acquisitionDurationSeconds<=60 && ...
-    summary.maximumCallbackAgeMs<=options.maximumSampleAgeMs;
-report=saveRealtimeReport(report,preflight,summary);
+    summary.maximumCallbackAgeMs<=monitorOptions.maximumSampleAgeMs;
+report.observerWarnings=observerWarnings;
 if report.success, observerState="PASSED"; observerType="stage_completed"; else, observerState="FAILED"; observerType="stage_failed"; end
-notifyHardwareAcceptanceObserver(options,observerType,"realtime_monitor",observerState,1, ...
-    "Real-time monitor acceptance completed.",report);
-notifyHardwareAcceptanceObserver(options,"report_saved","artifact_save","PASSED",1, ...
-    "Real-time report saved.",struct('matFile',report.matFile,'jsonFile',report.jsonFile));
+capture(notifyHardwareAcceptanceObserver(acceptanceOptions,observerType,"realtime_monitor",observerState,1, ...
+    "Real-time monitor acceptance completed.",report));
+report.observerWarnings=observerWarnings;
+report=saveRealtimeReport(report,preflight,summary);
+capture(notifyHardwareAcceptanceObserver(acceptanceOptions,"report_saved","artifact_save","PASSED",1, ...
+    "Real-time report saved.",struct('matFile',report.matFile,'jsonFile',report.jsonFile)));
+report.observerWarnings=observerWarnings; persistRealtimeReport(report,preflight,summary);
+
+    function capture(value)
+        if strlength(value)>0, observerWarnings(end+1,1)=value; end
+    end
+end
+
+function persistRealtimeReport(report,preflight,summary)
+save(char(report.matFile),'report','preflight','summary','-v7');
+fileId=fopen(char(report.jsonFile),'w');
+if fileId<0, error('IMU:AcceptanceSaveFailed','Cannot write %s.',report.jsonFile); end
+cleanup=onCleanup(@()fclose(fileId)); fprintf(fileId,'%s',jsonencode(report,'PrettyPrint',true)); clear cleanup;
 end
 
 function report=saveRealtimeReport(report,preflight,summary)

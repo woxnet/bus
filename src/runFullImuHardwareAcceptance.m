@@ -22,6 +22,7 @@ combined=struct('success',false,'generatedAt',datetime('now','TimeZone','UTC'), 
     'monitorMethodsValid',false,'matlabRestartRequired',false, ...
     'observerWarnings',strings(0,1));
 calibrationReport=[]; runtimeReport=[]; realtimeReport=[];
+childOptions=struct(); if isfield(options,'Observer'), childOptions.Observer=options.Observer; end
 try
     notify("stage_started","bootstrap","RUNNING",0,"Acceptance bootstrap started.",struct());
     api=dependencies.assertClassApi();
@@ -50,40 +51,34 @@ end
 
 try
     combined.failurePhase="installation_calibration";
-    notify("stage_started","installation_calibration","RUNNING",0,"Installation calibration started.",struct());
-    calibrationReport=dependencies.runCalibration();
+    calibrationReport=runChild(dependencies.runCalibration,"installation_calibration");
     verifyPhaseReport(calibrationReport,combined.checkoutCommit);
     if ~phaseSuccess(calibrationReport)
-        notify("stage_failed","installation_calibration","FAILED",1,"Installation calibration failed.",calibrationReport);
         combined=finishFailedPhase(combined,calibrationReport,artifactDirectory);
         return;
     end
-    notify("stage_completed","installation_calibration","PASSED",1,"Installation calibration passed.",calibrationReport);
+    combined.observerWarnings=[combined.observerWarnings; childWarnings(calibrationReport)];
 
     combined.failurePhase="runtime_fifo";
-    notify("stage_started","runtime_fifo","RUNNING",0,"Runtime FIFO acceptance started.",struct());
-    runtimeReport=dependencies.runRuntime();
+    runtimeReport=runChild(dependencies.runRuntime,"runtime_fifo");
     verifyPhaseReport(runtimeReport,combined.checkoutCommit);
     if ~phaseSuccess(runtimeReport)
-        notify("stage_failed","runtime_fifo","FAILED",1,"Runtime FIFO acceptance failed.",runtimeReport);
         combined=attachReport(combined,'calibrationReport',calibrationReport);
         combined=finishFailedPhase(combined,runtimeReport,artifactDirectory);
         return;
     end
-    notify("stage_completed","runtime_fifo","PASSED",1,"Runtime FIFO acceptance passed.",runtimeReport);
+    combined.observerWarnings=[combined.observerWarnings; childWarnings(runtimeReport)];
 
     combined.failurePhase="realtime_monitor";
-    notify("stage_started","realtime_monitor","RUNNING",0,"Real-time monitor acceptance started.",struct());
-    realtimeReport=dependencies.runRealtime();
+    realtimeReport=runChild(dependencies.runRealtime,"realtime_monitor");
     verifyPhaseReport(realtimeReport,combined.checkoutCommit);
     if ~phaseSuccess(realtimeReport)
-        notify("stage_failed","realtime_monitor","FAILED",1,"Real-time monitor acceptance failed.",realtimeReport);
         combined=attachReport(combined,'calibrationReport',calibrationReport);
         combined=attachReport(combined,'runtimeReport',runtimeReport);
         combined=finishFailedPhase(combined,realtimeReport,artifactDirectory);
         return;
     end
-    notify("stage_completed","realtime_monitor","PASSED",1,"Real-time monitor acceptance passed.",realtimeReport);
+    combined.observerWarnings=[combined.observerWarnings; childWarnings(realtimeReport)];
 catch exception
     combined.infrastructureFailure=true;
     combined.errors(end+1,1)=formatException(exception);
@@ -128,19 +123,20 @@ end
 notify("stage_started","artifact_save","RUNNING",0,"Saving combined report.",struct());
 combined=saveCombined(combined,artifactDirectory);
 notify("report_saved","artifact_save","PASSED",1,"Combined report saved.",struct('matFile',combined.matFile,'jsonFile',combined.jsonFile));
+persistCombined(combined);
 
     function dependencies=defaultDependencies()
         dependencies=struct( ...
             'assertClassApi',@()assertImuAcceptanceClassApi( ...
                 struct('ThrowOnFailure',false)), ...
             'getCommit',@()getImuAcceptanceCommit(), ...
-            'runCalibration',@()runInstallationCalibrationHardwareAcceptance(), ...
-            'runRuntime',@runRuntimePhase, ...
-            'runRealtime',@()runRealtimeHardwareAcceptance(), ...
+            'runCalibration',@(child)runInstallationCalibrationHardwareAcceptance(child), ...
+            'runRuntime',@(child)runRuntimePhase(child), ...
+            'runRealtime',@(child)runRealtimeHardwareAcceptance(child), ...
             'summarize',@summarizeBusImuAcceptance);
     end
 
-    function report=runRuntimePhase()
+    function report=runRuntimePhase(child)
         config=getImuConfig();
         imu=ImuBrick2(config.uid,config.host,config.port);
         imuCleanup=onCleanup(@()imu.disconnect());
@@ -148,7 +144,22 @@ notify("report_saved","artifact_save","PASSED",1,"Combined report saved.",struct
         if ~preflight.success
             error('IMU:PreflightFailed','%s',strjoin(preflight.errors," "));
         end
-        report=runImuHardwareAcceptance(imu,60,artifactDirectory);
+        report=runImuHardwareAcceptance(imu,60,artifactDirectory,child);
+    end
+
+    function report=runChild(action,stage)
+        acceptsOptions=nargin(action)~=0;
+        if ~acceptsOptions, notify("stage_started",stage,"RUNNING",0,stage+" started.",struct()); end
+        if acceptsOptions, report=action(childOptions); else, report=action(); end
+        if ~acceptsOptions
+            if phaseSuccess(report), type="stage_completed"; state="PASSED"; else, type="stage_failed"; state="FAILED"; end
+            notify(type,stage,state,1,stage+" completed.",report);
+        end
+    end
+
+    function warnings=childWarnings(report)
+        warnings=strings(0,1);
+        if isstruct(report) && isfield(report,'observerWarnings'), warnings=string(report.observerWarnings(:)); end
     end
 
     function notify(type,stage,state,progress,message,payload)
@@ -163,6 +174,13 @@ notify("report_saved","artifact_save","PASSED",1,"Combined report saved.",struct
             warning('IMU:AcceptanceObserverFailed','Acceptance observer failed: %s',observerException.message);
         end
     end
+end
+
+function persistCombined(combined)
+save(char(combined.matFile),'combined','-v7');
+fileId=fopen(char(combined.jsonFile),'w');
+if fileId<0, error('IMU:AcceptanceSaveFailed','Cannot write %s.',combined.jsonFile); end
+cleanup=onCleanup(@()fclose(fileId)); fprintf(fileId,'%s',jsonencode(combined,'PrettyPrint',true)); clear cleanup;
 end
 
 function combined=copyApiDiagnostics(combined,api)

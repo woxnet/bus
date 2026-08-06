@@ -20,7 +20,9 @@ classdef TestBusDrivingSystemController < matlab.unittest.TestCase
             states=strings(0,1); c.OnStateChanged=@(~,s)capture(s);
             c.startSystem(); c.startRealtime(); summary=c.stopRealtime();
             testCase.verifyTrue(summary.success); testCase.verifyEqual(c.State,"STOPPED");
-            testCase.verifyTrue(all(ismember(["READY","STREAMING","QUIESCING","DRAINING_TAIL","FINALIZING_RECORDING","RELEASING_STREAM","STOPPED"],states)));
+            testCase.verifyTrue(all(ismember(["READY","STREAMING","STOP_DEFERRED","STOPPING","QUIESCING", ...
+                "DRAINING_TAIL","FINAL_STATS","FINALIZING_EVENTS","FINALIZING_RECORDING", ...
+                "CLEARING_BUFFER","RELEASING_OWNER","STOPPED"],states)));
             function capture(status), states(end+1,1)=status.lifecycleState; end
         end
         function callbackFailureIsIsolated(testCase)

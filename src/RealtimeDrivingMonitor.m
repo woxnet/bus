@@ -81,6 +81,7 @@ classdef RealtimeDrivingMonitor < handle
         LastRecordingStorageGuardSeconds=-Inf
         LifecycleState="IDLE"
         LastCallbackStats=[]
+        LastFreeDiskBytes=NaN
     end
 
     methods
@@ -318,6 +319,7 @@ classdef RealtimeDrivingMonitor < handle
             obj.BatchProcessing=false; obj.DeferredStopRequested=false;
             obj.DeferredStopReason=""; obj.LastRecordingStorageGuardSeconds=-Inf;
             obj.LastCallbackStats=[];
+            obj.LastFreeDiskBytes=NaN;
             obj.Recorder=[]; obj.OwnsRecorder=false; obj.Dashboard=[]; obj.Timer=[];
             obj.resetProcessingState(); obj.PendingEvents=cell(5,1);
             sampleCapacity=max(1,ceil(obj.Config.historySeconds*obj.Config.sampleRateHz));
@@ -359,6 +361,7 @@ classdef RealtimeDrivingMonitor < handle
                 'sessionId',"",'directory',"",'samplesWritten',0,'bytesWritten',0, ...
                 'estimatedBufferedBytes',0,'maximumSessionBytes',obj.Config.maximumSessionBytes, ...
                 'minimumFreeDiskBytes',obj.Config.minimumFreeDiskBytes, ...
+                'freeDiskBytes',obj.LastFreeDiskBytes,'durationSeconds',stats.acquisitionDurationSeconds, ...
                 'maximumDurationSeconds',obj.Config.maximumRecordingDurationSeconds, ...
                 'stopReason',obj.StopReason);
             if ~isempty(obj.Recorder)
@@ -390,6 +393,25 @@ classdef RealtimeDrivingMonitor < handle
                 'recording',recording,'stopReason',obj.StopReason, ...
                 'acquisitionDurationSeconds',stats.acquisitionDurationSeconds, ...
                 'shutdownDurationSeconds',stats.shutdownDurationSeconds);
+            status.latestSensorSample=obj.LatestSensorSample;
+            status.latestVehicleSample=obj.LatestVehicleSample;
+            status.latestProcessedSample=obj.LatestProcessedSample;
+            status.currentCallbackAgeMs=0;
+            if isstruct(obj.LatestProcessedSample) && isfield(obj.LatestProcessedSample,'callbackAgeMs')
+                status.currentCallbackAgeMs=double(obj.LatestProcessedSample.callbackAgeMs);
+            end
+            status.maximumCallbackAgeMs=obj.MaximumCallbackAgeMs;
+            status.freeDiskBytes=obj.LastFreeDiskBytes;
+            status.durationSeconds=stats.acquisitionDurationSeconds;
+            status.bytesWritten=recording.bytesWritten;
+            status.estimatedBufferedBytes=recording.estimatedBufferedBytes;
+            status.bufferCapacity=0; status.bufferUtilization=0;
+            if isstruct(callbackStats)
+                if isfield(callbackStats,'capacity'), status.bufferCapacity=double(callbackStats.capacity); end
+                if status.bufferCapacity>0 && isfield(callbackStats,'buffered')
+                    status.bufferUtilization=double(callbackStats.buffered)/status.bufferCapacity;
+                end
+            end
             try
                 if isprop(obj.Imu,'StreamOwner'), status.streamOwner=string(obj.Imu.StreamOwner); end
             catch, end
@@ -780,6 +802,7 @@ classdef RealtimeDrivingMonitor < handle
                     obj.Config.recordingGuardPeriodSeconds
                 obj.LastRecordingStorageGuardSeconds=elapsed;
                 freeBytes=obj.Dependencies.getFreeDiskBytes(obj.Config.recordingDirectory);
+                obj.LastFreeDiskBytes=freeBytes;
                 if freeBytes<obj.Config.minimumFreeDiskBytes
                     reason="minimum_free_disk"; message="Minimum free disk reserve reached.";
                 elseif ismethod(obj.Recorder,'getSessionBytes') && ...

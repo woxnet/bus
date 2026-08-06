@@ -15,7 +15,8 @@ classdef FakeSystemMonitor < handle
     methods
         function start(obj), obj.IsRunning=true; obj.lifecycle("STREAMING"); end
         function summary=stop(obj,varargin)
-            for state=["STOP_DEFERRED","QUIESCING","DRAINING_TAIL","FINALIZING_RECORDING","RELEASING_OWNER"]
+            for state=["STOP_DEFERRED","STOPPING","QUIESCING","DRAINING_TAIL","FINAL_STATS", ...
+                    "FINALIZING_EVENTS","FINALIZING_RECORDING","CLEARING_BUFFER","RELEASING_OWNER"]
                 obj.lifecycle(state);
             end
             obj.IsRunning=false; obj.lifecycle("STOPPED"); summary=struct('success',true,'stopReason',"operator_stop");

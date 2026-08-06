@@ -5,6 +5,7 @@ if nargin<1, showDashboard=true; end
 fprintf('SYNTHETIC DEMONSTRATION\nNOT A HARDWARE ACCEPTANCE\n');
 syntheticController=SyntheticBusDrivingSystemController();
 syntheticDashboard=BusDrivingSystemDashboard(syntheticController);
-summary=syntheticController.simulate(60);
 if showDashboard, syntheticDashboard.open(); end
+syntheticController.startSimulation(60,10);
+summary=syntheticController.getSimulationSummary();
 end
