@@ -324,6 +324,12 @@ user-callback failure is isolated from acquisition. `RealtimeDrivingMonitor`
 remains the sole FIFO consumer. Displayed driving events are diagnostic
 candidates, not a driver score or a disciplinary conclusion.
 
+Each operation or hardware-acceptance execution has a distinct `runId`,
+sequence number, mode, and UTC start time. Starting a new run atomically clears
+run-scoped signals, events, stages, calibration progress, recorder/callback
+status, acceptance results, warnings, and errors. The dashboard detects the new
+`runId` and clears old plots and tables before rendering the new run.
+
 Start the hardware-free demonstration asynchronously with:
 
 ```matlab

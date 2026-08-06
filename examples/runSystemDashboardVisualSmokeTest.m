@@ -5,20 +5,26 @@ dashboardDependencies=struct('beforeTabRender',@injectOneRenderFailure);
 [controller,dashboard,~]=run_synthetic_system_visualization_demo(true, ...
     struct('SimulationSpeed',4,'DashboardDependencies',dashboardDependencies));
 cleanup=onCleanup(@()delete(dashboard));
-uiWarnings=strings(0,1); started=tic; selectedIndex=1;
+uiWarnings=strings(0,1);
 tabs=["Overview","Signals","Events","Data quality","Calibration","Recording","Hardware acceptance"];
-thresholds=[0 7 19 43 47 51 55]; dashboard.selectTab(tabs(selectedIndex));
-selectedBaseline=tabCount(tabs(selectedIndex));
-while controller.IsSimulationRunning && toc(started)<20
-    if selectedIndex<numel(tabs) && controller.SimulatedSeconds>=thresholds(selectedIndex+1) && ...
-            tabCount(tabs(selectedIndex))>=selectedBaseline+2
-        selectedIndex=selectedIndex+1; dashboard.selectTab(tabs(selectedIndex));
-        selectedBaseline=tabCount(tabs(selectedIndex));
-    end
-    pause(0.05); drawnow; collectWarning();
-end
-controller.waitForCompletion(2);
-for tab=[tabs,"Log"], waitForTabCycles(tab,2); end
+exerciseRun(); firstSummary=controller.getSimulationSummary(); firstSnapshot=controller.getTelemetrySnapshot();
+firstRunId=firstSnapshot.runId;
+
+controller.startSimulation(60,4);
+dashboard.selectTab("Signals"); dashboard.render(); cleanDiagnostics=dashboard.getGraphicsDiagnostics();
+signalsStartedClean=all(arrayfun(@(h)isempty(h.XData),cleanDiagnostics.rawLines)) && ...
+    all(arrayfun(@(h)isempty(h.XData),cleanDiagnostics.filteredLines));
+dashboard.selectTab("Events"); dashboard.render(); cleanDiagnostics=dashboard.getGraphicsDiagnostics();
+eventsStartedClean=isempty(cleanDiagnostics.eventTable.Data) && ...
+    ~cleanDiagnostics.detectorActivationObserved && ~cleanDiagnostics.eventMarkerObserved;
+dashboard.selectTab("Hardware acceptance"); dashboard.render(); cleanDiagnostics=dashboard.getGraphicsDiagnostics();
+acceptanceNamesAtStart=firstColumn(cleanDiagnostics.acceptanceTable.Data);
+acceptanceStartedClean=~any(acceptanceNamesAtStart=="Summary.success");
+secondRunStartedClean=signalsStartedClean && eventsStartedClean && acceptanceStartedClean;
+secondRunId=controller.getSummarySnapshot().runId;
+assert(secondRunId~=firstRunId && secondRunStartedClean && firstSummary.success);
+
+exerciseRun();
 summary=controller.getSimulationSummary(); snapshot=controller.getTelemetrySnapshot();
 diagnostics=dashboard.getGraphicsDiagnostics();
 required=["STOP_DEFERRED","QUIESCING","DRAINING_TAIL","RELEASING_OWNER","STOPPED"];
@@ -66,6 +72,10 @@ contentPassed=rawRendered && filteredRendered && markersRendered && eventRows==3
     quiverMagnitude>0 && recordingMetricsObserved && acceptanceSummaryObserved && logCoverage && allTabsRendered;
 result=struct('success',isempty(unhandled) && performancePassed && contentPassed && renderRetryPassed, ...
     'summary',summary,'files',files,'tabCount',numel(dashboard.getTabNames()), ...
+    'firstRunId',firstRunId,'secondRunId',secondRunId, ...
+    'secondRunStartedClean',secondRunStartedClean, ...
+    'syntheticSampleRateHz',controller.TelemetryHub.Config.sampleRateHz, ...
+    'signalHistoryDurationSeconds',snapshot.signalHistory(end).elapsedSeconds-snapshot.signalHistory(1).elapsedSeconds, ...
     'renderCount',dashboard.RenderCount,'tabRenderCounts',tabRenderCounts, ...
     'runtimeTelemetryRefreshCount',controller.RuntimeTelemetryRefreshCount, ...
     'qualityPointsRendered',qualityPointsRendered, ...
@@ -96,6 +106,21 @@ assert(result.success); clear cleanup; delete(dashboard);
         if string(tab)=="Signals" && ~retryInjected
             retryInjected=true; error('Test:SmokeRenderRetry','Injected smoke render retry.');
         end
+    end
+    function exerciseRun()
+        thresholds=[0 7 19 43 47 51 55]; selectedIndex=1;
+        dashboard.selectTab(tabs(selectedIndex)); selectedBaseline=tabCount(tabs(selectedIndex));
+        started=tic;
+        while controller.IsSimulationRunning && toc(started)<20
+            if selectedIndex<numel(tabs) && controller.SimulatedSeconds>=thresholds(selectedIndex+1) && ...
+                    tabCount(tabs(selectedIndex))>=selectedBaseline+2
+                selectedIndex=selectedIndex+1; dashboard.selectTab(tabs(selectedIndex));
+                selectedBaseline=tabCount(tabs(selectedIndex));
+            end
+            pause(0.05); drawnow; collectWarning();
+        end
+        controller.waitForCompletion(2);
+        for tab=[tabs,"Log"], waitForTabCycles(tab,2); end
     end
     function collectWarning()
         [message,identifier]=lastwarn();

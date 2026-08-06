@@ -23,7 +23,11 @@ classdef FakeSystemCalibrationController < handle
         end
         function confirmCurrentStep(obj), obj.Confirmed=true; end
         function rejectCurrentStep(obj), obj.Rejected=true; end
-        function cancel(obj,varargin), obj.IsRunning=false; if ~isempty(obj.OnCancelled), obj.OnCancelled(obj,struct()); end, end
+        function cancel(obj,varargin)
+            reason="cancelled"; if ~isempty(varargin), reason=string(varargin{1}); end
+            obj.IsRunning=false;
+            if ~isempty(obj.OnCancelled), obj.OnCancelled(obj,struct('cancelReason',reason)); end
+        end
         function close(obj), obj.IsRunning=false; end
     end
 end

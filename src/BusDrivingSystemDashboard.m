@@ -60,6 +60,7 @@ classdef BusDrivingSystemDashboard < handle
         LastRenderTickAt=NaT
         CurrentConsecutiveDeadlineMisses=0
         RetryPending=false
+        LastRunId=""
     end
     methods
         function obj=BusDrivingSystemDashboard(controller,config,dependencies)
@@ -86,6 +87,7 @@ classdef BusDrivingSystemDashboard < handle
             end
             if ismethod(obj.Controller,'getSummarySnapshot'), summary=obj.Controller.getSummarySnapshot();
             else, summary=obj.Controller.getTelemetrySnapshot(); end
+            obj.resetForRunIfNeeded(summary);
             obj.LastSnapshot=summary; obj.renderPipeline(summary); obj.renderOverview(summary); obj.updateControls(summary);
             selected=obj.selectedTabTitle(); full=[];
             obj.recordTabRender(selected);
@@ -671,6 +673,28 @@ classdef BusDrivingSystemDashboard < handle
             key=matlab.lang.makeValidName(char(string(title)));
             if ~isfield(obj.TabRenderCounts,key), obj.TabRenderCounts.(key)=0; end
             obj.TabRenderCounts.(key)=obj.TabRenderCounts.(key)+1;
+        end
+        function resetForRunIfNeeded(obj,snapshot)
+            runId=string(obj.field(snapshot,'runId',""));
+            if runId==obj.LastRunId, return; end
+            obj.LastRunId=runId; obj.LastRenderedRevisions=struct(); obj.LastSnapshot=[];
+            obj.DetectorActivationObserved=false; obj.EventMarkerObserved=false;
+            groups={obj.RawLines,obj.FilteredLines,obj.MarkerScatters,obj.QualityLines};
+            for groupIndex=1:numel(groups)
+                handles=groups{groupIndex};
+                for handleIndex=1:numel(handles)
+                    handle=handles(handleIndex); if isvalid(handle), obj.setSeries(handle,[],[],false); end
+                end
+            end
+            tables={obj.EventTable,obj.DetectorTable,obj.QualityTable,obj.CalibrationTable, ...
+                obj.RecordingTable,obj.AcceptanceTable,obj.LogTable};
+            for index=1:numel(tables)
+                handle=tables{index}; if ~isempty(handle) && isvalid(handle), handle.Data=cell(0,numel(handle.ColumnName)); end
+            end
+            for index=1:numel(obj.CalibrationQuivers)
+                handle=obj.CalibrationQuivers(index); handle.UData=0; handle.VData=0; handle.WData=0;
+            end
+            for index=1:numel(obj.RecordingGauges), obj.RecordingGauges(index).Value=0; end
         end
         function changed=revisionNeedsRender(obj,snapshot,name)
             revision=double(obj.field(snapshot,name,-1));

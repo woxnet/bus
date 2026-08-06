@@ -19,6 +19,8 @@ classdef BusDrivingSystemController < handle
         AcceptanceRunning=false
         LastRuntimeTelemetryRefresh=-Inf
         RuntimeTelemetryRefreshCount=0
+        RunId=""
+        RunSequence=0
     end
     properties
         OnStateChanged=[]
@@ -52,12 +54,15 @@ classdef BusDrivingSystemController < handle
             obj.Options=obj.mergeOptions(options);
             obj.Dependencies=obj.mergeDependencies(dependencies);
             obj.TelemetryHub=BusDrivingSystemTelemetryHub(obj.Options.dashboardConfig,obj.Dependencies.nowUtc);
+            imuConfig=getImuConfig();
+            obj.TelemetryHub.updateMetadata(struct('busId',string(obj.Options.busId), ...
+                'configuredImuUid',string(imuConfig.uid),'dashboardConfig',obj.Options.dashboardConfig));
             obj.RuntimeTelemetryClock=obj.Dependencies.monotonicClockStart();
         end
         function startSystem(obj)
             obj.requireOpen(); obj.requireState(["IDLE","STOPPED","COMPLETED"]);
             if obj.IsConnected && ~isempty(obj.Imu), obj.disconnectImu(); end
-            obj.StartedAt=obj.nowUtc(); obj.CompletedAt=NaT; obj.Mode="operation";
+            obj.beginRun("operation"); obj.Calibration=[]; obj.Preflight=[]; obj.AcceptanceResult=[];
             try
                 obj.startStage("Bootstrap","Starting system.");
                 obj.transition("BOOTSTRAP","Bootstrap",0,"Starting system.");
@@ -88,6 +93,13 @@ classdef BusDrivingSystemController < handle
                 obj.transition("PREFLIGHT","Preflight",0,"Running hardware preflight.");
                 obj.Preflight=obj.Dependencies.runPreflight(obj.Imu);
                 obj.TelemetryHub.updateMetadata(struct('preflight',obj.Preflight));
+                physical=struct('connection',struct('connected',obj.IsConnected));
+                if isfield(obj.Preflight,'identity') && isstruct(obj.Preflight.identity)
+                    physical.imuUid=string(obj.field(obj.Preflight.identity,'uid',""));
+                end
+                if isfield(obj.Preflight,'firmwareVersion'), physical.firmwareVersion=obj.Preflight.firmwareVersion; end
+                if isfield(obj.Preflight,'sensorFusionMode'), physical.sensorFusionMode=obj.Preflight.sensorFusionMode; end
+                obj.TelemetryHub.updateMetadata(physical);
                 if isstruct(obj.Preflight) && isfield(obj.Preflight,'success') && ~obj.Preflight.success
                     error('IMU:PreflightFailed','%s',obj.reportErrors(obj.Preflight));
                 end
@@ -132,14 +144,16 @@ classdef BusDrivingSystemController < handle
                 obj.startStage("Realtime","Starting real-time monitor.");
                 obj.transition("STARTING_REALTIME","Realtime",0,"Starting real-time monitor.");
                 obj.RealtimeMonitor=obj.Dependencies.createRealtimeMonitor(obj.Imu,obj.Calibration);
-                obj.attachMonitorCallbacks(); obj.RealtimeMonitor.start();
-                obj.completeStage("Realtime","Real-time monitor started.");
+                obj.attachMonitorCallbacks(); startupStarted=obj.monotonicElapsed(); obj.RealtimeMonitor.start();
+                obj.TelemetryHub.updateMetadata(struct('realtimeStartupDurationSeconds', ...
+                    obj.monotonicElapsed()-startupStarted));
                 obj.transition("STREAMING","Realtime",1,"Real-time monitoring active.");
                 obj.LastRuntimeTelemetryRefresh=-Inf;
                 status=obj.refreshRealtimeTelemetry();
                 if isstruct(status) && isfield(status,'recording') && ...
                         isstruct(status.recording) && obj.field(status.recording,'enabled',false)
                     obj.startStage("Recording","Recording active.");
+                    obj.TelemetryHub.ingestState(obj.getStatus());
                 end
             catch exception
                 obj.fail(exception); rethrow(exception);
@@ -152,6 +166,7 @@ classdef BusDrivingSystemController < handle
             obj.transition("STOP_REQUESTED","Stopping",0,"Stop requested.");
             summary=obj.RealtimeMonitor.stop("operator_stop");
             obj.completeStage("Recording","Recording finalized.");
+            obj.completeStage("Realtime","Real-time monitoring completed.");
             obj.completeStage("Stopping","Real-time monitor stopped safely.");
             if ~obj.RealtimeMonitor.IsRunning
                 obj.startStage("Result","Finalizing operation result.");
@@ -166,7 +181,7 @@ classdef BusDrivingSystemController < handle
             if obj.monitorActive() || obj.calibrationActive() || ~any(obj.State==allowed)
                 error('IMU:SystemBusy','Controller state %s cannot run hardware acceptance.',obj.State);
             end
-            obj.Mode="acceptance";
+            obj.beginRun("acceptance"); obj.AcceptanceResult=[];
             obj.AcceptanceRunning=true; acceptanceCleanup=onCleanup(@()obj.clearAcceptanceRunning());
             obj.transition("RUNNING_ACCEPTANCE","Hardware acceptance",0,"Hardware acceptance started.");
             try
@@ -301,6 +316,8 @@ classdef BusDrivingSystemController < handle
         end
         function onCalibrationCancelled(obj,result)
             obj.TelemetryHub.ingestCalibrationResult(result);
+            reason=string(obj.field(result,'cancelReason',"calibration_cancelled"));
+            obj.cancelStage("Calibration",reason); obj.cancelStage("Verification",reason);
             obj.transition("CANCELLED","Calibration",obj.StageProgress,"Calibration cancelled.");
         end
         function onCalibrationError(obj,exception), obj.fail(exception); end
@@ -334,6 +351,8 @@ classdef BusDrivingSystemController < handle
         function forwardError(obj,value), obj.TelemetryHub.ingestError(value); obj.emit(obj.OnError,value); end
         function forwardStopped(obj,summary)
             obj.TelemetryHub.ingestMonitorStatus(obj.RealtimeMonitor.getStatus());
+            obj.completeStage("Recording","Recording finalized.");
+            obj.completeStage("Realtime","Real-time monitoring completed.");
             obj.emit(obj.OnStopped,summary);
         end
         function onAcceptanceEvent(obj,event)
@@ -364,6 +383,14 @@ classdef BusDrivingSystemController < handle
             if ~any(obj.ActiveOperationStages==stage), return; end
             event=struct('timestamp',obj.nowUtc(),'type',"stage_completed",'stage',string(stage), ...
                 'state',"PASSED",'progress',1,'message',string(message),'payload',struct());
+            obj.TelemetryHub.ingestStage(event); obj.emit(obj.OnStageCompleted,event);
+            obj.ActiveOperationStages(obj.ActiveOperationStages==stage)=[];
+        end
+        function cancelStage(obj,stage,reason)
+            stage=string(stage); if obj.Mode~="operation" || ~any(obj.ActiveOperationStages==stage), return; end
+            event=struct('timestamp',obj.nowUtc(),'type',"stage_cancelled",'stage',stage, ...
+                'state',"CANCELLED",'progress',obj.StageProgress,'message',string(reason), ...
+                'payload',struct('cancelReason',string(reason)),'runId',obj.RunId);
             obj.TelemetryHub.ingestStage(event); obj.emit(obj.OnStageCompleted,event);
             obj.ActiveOperationStages(obj.ActiveOperationStages==stage)=[];
         end
@@ -436,6 +463,16 @@ classdef BusDrivingSystemController < handle
             obj.TelemetryHub.ingestStage(struct('timestamp',obj.nowUtc(),'type',"operator_"+string(type), ...
                 'stage',obj.CurrentStage,'state',obj.State,'progress',obj.StageProgress, ...
                 'message',string(message),'payload',struct('source',"operator")));
+        end
+        function beginRun(obj,mode)
+            obj.RunSequence=obj.RunSequence+1; obj.Mode=string(mode);
+            obj.StartedAt=obj.nowUtc(); obj.CompletedAt=NaT; obj.LastError=[];
+            stamp=string(obj.StartedAt,'yyyyMMdd''T''HHmmssSSS''Z''');
+            prefix="system"; if obj.Mode=="acceptance", prefix="acceptance"; end
+            obj.RunId=prefix+"_"+stamp+"_"+string(obj.RunSequence);
+            obj.ActiveOperationStages=strings(0,1);
+            obj.TelemetryHub.beginRun(struct('runId',obj.RunId,'runSequence',obj.RunSequence, ...
+                'runMode',obj.Mode,'runStartedAt',obj.StartedAt));
         end
         function value=nowUtc(obj), value=obj.Dependencies.nowUtc(); end
         function text=reportErrors(~,report)

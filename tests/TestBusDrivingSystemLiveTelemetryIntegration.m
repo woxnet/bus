@@ -98,7 +98,9 @@ classdef TestBusDrivingSystemLiveTelemetryIntegration < matlab.unittest.TestCase
             dependencies.runPreflight=@(~)preflight(); dependencies.createRealtimeMonitor=@(~,~)monitor();
             controller=BusDrivingSystemController(struct(),dependencies); testCase.addTeardown(@()delete(controller));
             controller.startSystem(); controller.startRealtime(); controller.stopRealtime(); stages=controller.TelemetryHub.getStages();
-            verify("Bootstrap",2.5); verify("Preflight",10); verify("Realtime",1.5); verify("Stopping",.8);
+            verify("Bootstrap",2.5); verify("Preflight",10); verify("Realtime",2.3); verify("Stopping",.8);
+            snapshot=controller.getTelemetrySnapshot();
+            testCase.verifyEqual(snapshot.realtimeStartupDurationSeconds,1.5,'AbsTol',1e-9);
             function value=getCommit(), advance(2.5); value="0123456789012345678901234567890123456789"; end
             function value=preflight(), advance(10); value=struct('success',true,'errors',strings(0,1)); end
             function value=monitor(), value=FakeSystemMonitor(); value.StartAction=@()advance(1.5); value.StopAction=@()advance(.8); end

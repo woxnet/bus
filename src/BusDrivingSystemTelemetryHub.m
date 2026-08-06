@@ -44,6 +44,31 @@ classdef BusDrivingSystemTelemetryHub < handle
             obj.Logs=cell(config.maximumLogRows,1); obj.Stages=cell(config.maximumStageHistory,1);
             obj.Snapshot=obj.emptySnapshot(); obj.NowUtc=nowUtc;
         end
+        function beginRun(obj,runInfo)
+            if nargin<2 || ~isstruct(runInfo), runInfo=struct(); end
+            retained=struct('busId',obj.value(obj.Snapshot,'busId',""), ...
+                'configuredImuUid',obj.value(obj.Snapshot,'configuredImuUid',""), ...
+                'dashboardConfig',obj.Config);
+            obj.Snapshot=obj.emptySnapshot();
+            obj.Snapshot.busId=retained.busId;
+            obj.Snapshot.configuredImuUid=retained.configuredImuUid;
+            obj.Snapshot.dashboardConfig=retained.dashboardConfig;
+            obj.Snapshot.runId=string(obj.value(runInfo,'runId',""));
+            obj.Snapshot.runSequence=double(obj.value(runInfo,'runSequence',0));
+            obj.Snapshot.runMode=string(obj.value(runInfo,'runMode',"operation"));
+            obj.Snapshot.runStartedAt=obj.value(runInfo,'runStartedAt',obj.NowUtc());
+            obj.Snapshot.mode=obj.Snapshot.runMode;
+            obj.Samples(:)={[]}; obj.SampleIndex=0; obj.SampleCount=0;
+            obj.Events(:)={[]}; obj.EventIndex=0; obj.EventCount=0;
+            obj.Logs(:)={[]}; obj.LogIndex=0; obj.LogCount=0;
+            obj.Stages(:)={[]}; obj.StageIndex=0; obj.StageCount=0;
+            obj.ActiveStageStarts=cell(0,1);
+            obj.LastLoggedLifecycleState=""; obj.LastLoggedStage="";
+            obj.LastLoggedMessage=""; obj.LastLoggedSeverity="";
+            obj.SamplesIngested=0; obj.EventsIngested=0; obj.LogsIngested=0;
+            obj.SignalRevision=0; obj.EventRevision=0; obj.LogRevision=0;
+            obj.StageRevision=0; obj.CalibrationRevision=0; obj.AcceptanceRevision=0;
+        end
         function ingestState(obj,status)
             if ~isstruct(status), return; end
             obj.copyField(status,'lifecycleState'); obj.copyField(status,'currentStage');
@@ -71,7 +96,7 @@ classdef BusDrivingSystemTelemetryHub < handle
                 record=obj.newStageRecord(event,timestamp,stage); index=obj.putStage(record);
                 obj.ActiveStageStarts{end+1,1}=struct('stage',stage,'stageRunId',record.stageRunId, ...
                     'startedAt',record.startedAt,'bufferIndex',index);
-            elseif any(type==["stage_progress","stage_completed","stage_failed"])
+            elseif any(type==["stage_progress","stage_completed","stage_failed","stage_cancelled"])
                 [registryIndex,bufferIndex]=obj.findActiveStage(stage,obj.value(event,'stageRunId',[]));
                 if registryIndex==0
                     record=obj.newStageRecord(event,timestamp,stage); bufferIndex=obj.putStage(record);
@@ -81,14 +106,14 @@ classdef BusDrivingSystemTelemetryHub < handle
                 end
                 record=obj.Stages{bufferIndex}; record=obj.updateStageRecord(record,event,timestamp,type);
                 obj.Stages{bufferIndex}=record;
-                if any(type==["stage_completed","stage_failed"])
+                if any(type==["stage_completed","stage_failed","stage_cancelled"])
                     obj.ActiveStageStarts(registryIndex)=[];
                     if type=="stage_completed" && ~any(obj.Snapshot.completedStages==stage)
                         obj.Snapshot.completedStages(end+1,1)=stage;
                     end
                 end
             end
-            if any(type==["stage_started","stage_progress","stage_completed","stage_failed"])
+            if any(type==["stage_started","stage_progress","stage_completed","stage_failed","stage_cancelled"])
                 obj.StageRevision=obj.StageRevision+1;
             end
             if isfield(event,'stage'), obj.Snapshot.currentStage=string(event.stage); end
@@ -248,9 +273,11 @@ classdef BusDrivingSystemTelemetryHub < handle
                 'verificationScore',NaN,'activationAttempted',false,'activationVerified',false, ...
                 'rollbackAttempted',false,'rollbackSucceeded',false,'finalFile',"", ...
                 'workingFile',"",'backupFile',"");
-            s=struct('generatedAt',NaT,'mode',"operation",'lifecycleState',"IDLE", ...
+            s=struct('generatedAt',NaT,'mode',"operation",'runId',"",'runSequence',0, ...
+                'runMode',"operation",'runStartedAt',NaT,'lifecycleState',"IDLE", ...
                 'currentStage',"",'stageProgress',0,'message',"",'severity',"info", ...
-                'checkoutCommit',"",'busId',"",'imuUid',"",'firmwareVersion',[], ...
+                'checkoutCommit',"",'busId',"",'configuredImuUid',"",'dashboardConfig',struct(), ...
+                'imuUid',"",'firmwareVersion',[], ...
                 'sensorFusionMode',[],'connection',struct(),'preflight',struct(), ...
                 'calibration',calibration,'verification',struct(),'realtime',struct(), ...
                 'callback',callback,'recording',recording,'dataQuality',struct(), ...
@@ -333,7 +360,8 @@ classdef BusDrivingSystemTelemetryHub < handle
         end
         function entry=makeLog(obj,severity,source,stage,type,message,payload)
             if isa(payload,'MException'), payload=struct('identifier',payload.identifier,'message',payload.message); end
-            entry=struct('timestamp',obj.NowUtc(),'severity',string(severity), ...
+            entry=struct('timestamp',obj.NowUtc(),'runId',string(obj.Snapshot.runId), ...
+                'severity',string(severity), ...
                 'source',string(source),'stage',string(stage),'type',string(type), ...
                 'message',string(message),'payload',payload);
         end
@@ -350,7 +378,7 @@ classdef BusDrivingSystemTelemetryHub < handle
                 'progress',double(obj.value(event,'progress',0)), ...
                 'message',string(obj.value(event,'message',"")),'payload',obj.value(event,'payload',struct()), ...
                 'startedAt',started,'completedAt',NaT,'elapsedSeconds',max(0,seconds(timestamp-started)), ...
-                'stageRunId',double(runId));
+                'stageRunId',double(runId),'runId',string(obj.Snapshot.runId));
         end
         function record=updateStageRecord(obj,record,event,timestamp,type)
             record.timestamp=timestamp; record.type=type;
@@ -359,10 +387,11 @@ classdef BusDrivingSystemTelemetryHub < handle
             if isfield(event,'message'), record.message=string(event.message); end
             if isfield(event,'payload'), record.payload=event.payload; end
             record.elapsedSeconds=max(0,seconds(timestamp-record.startedAt));
-            if any(type==["stage_completed","stage_failed"])
+            if any(type==["stage_completed","stage_failed","stage_cancelled"])
                 record.completedAt=timestamp;
                 if type=="stage_completed" && ~isfield(event,'state'), record.state="PASSED"; end
                 if type=="stage_failed" && ~isfield(event,'state'), record.state="FAILED"; end
+                if type=="stage_cancelled", record.state="CANCELLED"; end
             end
         end
         function [registryIndex,bufferIndex]=findActiveStage(obj,stage,runId)

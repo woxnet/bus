@@ -13,6 +13,8 @@ classdef SyntheticBusDrivingSystemController < handle
         WarningHistory=strings(0,1)
         TimerErrors=strings(0,1)
         RuntimeTelemetryRefreshCount=0
+        RunId=""
+        RunSequence=0
     end
     properties(Access=private)
         SimulationTimer=[]
@@ -93,6 +95,13 @@ classdef SyntheticBusDrivingSystemController < handle
     methods(Access=private)
         function resetSimulation(obj)
             obj.stopSimulationTimer(); obj.State="IDLE"; obj.CurrentStage=""; obj.SimulatedSeconds=0;
+            obj.RunSequence=obj.RunSequence+1;
+            started=datetime('now','TimeZone','UTC'); stamp=started; stamp.Format='yyyyMMdd''T''HHmmssSSS''Z''';
+            obj.RunId="synthetic_"+string(stamp)+"_"+string(obj.RunSequence);
+            obj.TelemetryHub.beginRun(struct('runId',obj.RunId,'runSequence',obj.RunSequence, ...
+                'runMode',"synthetic",'runStartedAt',started));
+            obj.TelemetryHub.updateMetadata(struct('checkoutCommit',"SYNTHETIC", ...
+                'busId',"SYNTHETIC BUS",'imuUid',"SYNTHETIC IMU"));
             obj.IsSimulationComplete=false; obj.NextSampleIndex=1; obj.EventIndex=1;
             obj.ActiveSyntheticEvent=[]; obj.RuntimeTelemetryRefreshCount=0;
             obj.AppliedTransitions=false(1,20); obj.TransitionHistory=strings(0,1);
@@ -157,12 +166,13 @@ classdef SyntheticBusDrivingSystemController < handle
         end
         function generateSamples(obj)
             if obj.SimulatedSeconds<13, return; end
-            target=floor(obj.SimulatedSeconds*100)+1;
+            sampleRateHz=obj.TelemetryHub.Config.sampleRateHz;
+            target=floor(obj.SimulatedSeconds*sampleRateHz)+1;
             eventTypes=["BRAKING_CANDIDATE","TURN_LEFT_CANDIDATE","VERTICAL_SHOCK_CANDIDATE"];
             eventTimes=[15 19 40];
             while obj.NextSampleIndex<=target
-                t=(obj.NextSampleIndex-1)/100;
-                obj.TelemetryHub.ingestSample(obj.sample(t,obj.NextSampleIndex));
+                t=(obj.NextSampleIndex-1)/sampleRateHz;
+                obj.TelemetryHub.ingestSample(obj.sample(t,obj.NextSampleIndex,sampleRateHz));
                 if ~isempty(obj.ActiveSyntheticEvent) && ...
                         t>=obj.ActiveSyntheticEvent.startElapsedSeconds+obj.ActiveSyntheticEvent.durationSeconds
                     completed=obj.ActiveSyntheticEvent;
@@ -221,14 +231,14 @@ classdef SyntheticBusDrivingSystemController < handle
             value=obj.SimulationTimer; obj.SimulationTimer=[];
             try, if isvalid(value), stop(value); delete(value); end, catch, end
         end
-        function s=sample(~,t,k)
+        function s=sample(~,t,k,sampleRateHz)
             braking=-3.2*exp(-((t-20)/1.5)^2); turn=2.5*exp(-((t-30)/2)^2); shock=5*exp(-((t-40)/.15)^2);
             s=struct('elapsedSeconds',t,'sequenceNumber',uint64(k),'longitudinalRaw',braking+.08*sin(t*9), ...
                 'longitudinalFiltered',braking,'lateralRaw',turn+.05*cos(t*7),'lateralFiltered',turn, ...
                 'verticalRaw',shock+.03*sin(t*5),'verticalFiltered',shock,'yawRateRaw',turn*12, ...
                 'yawRateFiltered',turn*12,'longitudinalJerk',-braking,'lateralJerk',turn/2, ...
                 'verticalJerk',shock*3,'dataQuality',double(t<45)+.65*double(t>=45), ...
-                'callbackAgeMs',4+20*double(t>=45),'effectiveFrequencyHz',50);
+                'callbackAgeMs',4+20*double(t>=45),'effectiveFrequencyHz',sampleRateHz);
         end
         function e=event(~,type,t,k,index)
             duration=2; if index==2, duration=25; end
