@@ -9,6 +9,15 @@ classdef BusDrivingSystemDashboard < handle
         LastRenderMilliseconds=0
         LastSnapshot=[]
         MaximumObservedRenderMilliseconds=0
+        InitialRenderMilliseconds=NaN
+        RenderDurationHistory=zeros(0,1)
+        DroppedRenderTicks=0
+        RenderP50Milliseconds=NaN
+        RenderP95Milliseconds=NaN
+        MaximumSteadyStateRenderMilliseconds=0
+        ConsecutiveDeadlineMisses=0
+        UiDegraded=false
+        IsClosed=false
     end
     properties(Access=private)
         RenderTimer=[]
@@ -39,6 +48,12 @@ classdef BusDrivingSystemDashboard < handle
         QualityLines
         CalibrationQuivers
         LastRenderWarningAt=NaT
+        TabGroup
+        Tabs=struct()
+        LastRenderedRevisions=struct()
+        Rendering=false
+        LastRenderTickAt=NaT
+        CurrentConsecutiveDeadlineMisses=0
     end
     methods
         function obj=BusDrivingSystemDashboard(controller,config,dependencies)
@@ -53,19 +68,37 @@ classdef BusDrivingSystemDashboard < handle
             if ~isempty(obj.Figure) && isvalid(obj.Figure), return; end
             obj.buildUi();
             obj.RenderTimer=obj.Dependencies.createTimer('ExecutionMode','fixedSpacing','BusyMode','drop', ...
-                'Period',1/obj.Config.refreshHz,'TimerFcn',@(~,~)obj.renderSafely());
+                'Period',1/obj.Config.refreshHz,'TimerFcn',@(~,~)obj.renderSafely(true));
             obj.render(); start(obj.RenderTimer);
         end
         function render(obj)
             if isempty(obj.Figure) || ~isvalid(obj.Figure), return; end
-            started=tic; snapshot=obj.Controller.getTelemetrySnapshot(); obj.LastSnapshot=snapshot;
-            obj.renderPipeline(snapshot); obj.renderOverview(snapshot); obj.renderSignals(snapshot);
-            obj.renderEvents(snapshot); obj.renderQuality(snapshot); obj.renderCalibration(snapshot);
-            obj.renderRecording(snapshot); obj.renderAcceptance(snapshot); obj.renderLog(snapshot);
-            obj.updateControls(snapshot.lifecycleState);
-            obj.RenderCount=obj.RenderCount+1; obj.LastRenderMilliseconds=1000*toc(started);
-            obj.MaximumObservedRenderMilliseconds=max(obj.MaximumObservedRenderMilliseconds,obj.LastRenderMilliseconds);
-            obj.checkRenderDuration();
+            if obj.Rendering, obj.DroppedRenderTicks=obj.DroppedRenderTicks+1; return; end
+            obj.Rendering=true; renderCleanup=onCleanup(@()obj.finishRendering()); started=tic;
+            if ismethod(obj.Controller,'getSummarySnapshot'), summary=obj.Controller.getSummarySnapshot();
+            else, summary=obj.Controller.getTelemetrySnapshot(); end
+            obj.LastSnapshot=summary; obj.renderPipeline(summary); obj.renderOverview(summary); obj.updateControls(summary);
+            selected=obj.selectedTabTitle(); full=[];
+            switch selected
+                case "Signals"
+                    if obj.revisionChanged(summary,'signalRevision'), full=obj.Controller.getTelemetrySnapshot(); obj.renderSignals(full); end
+                case "Events"
+                    if obj.revisionChanged(summary,'eventRevision'), full=obj.Controller.getTelemetrySnapshot(); obj.renderEvents(full); end
+                case "Data quality"
+                    if obj.revisionChanged(summary,'signalRevision'), obj.renderQuality(summary); end
+                case "Calibration"
+                    if obj.revisionChanged(summary,'calibrationRevision'), obj.renderCalibration(summary); end
+                case "Recording"
+                    if obj.revisionChanged(summary,'signalRevision'), obj.renderRecording(summary); end
+                case "Hardware acceptance"
+                    if obj.revisionChangedAny(summary,{'stageRevision','acceptanceRevision'}), obj.renderAcceptance(summary); end
+                case "Log"
+                    if obj.revisionChanged(summary,'logRevision'), full=obj.Controller.getTelemetrySnapshot(); obj.renderLog(full); end
+            end
+            if ~isempty(full), obj.LastSnapshot=full; end
+            obj.LastRenderMilliseconds=1000*toc(started); obj.recordRenderDuration(obj.LastRenderMilliseconds);
+            obj.RenderCount=obj.RenderCount+1; obj.MaximumObservedRenderMilliseconds=max(obj.MaximumObservedRenderMilliseconds,obj.LastRenderMilliseconds);
+            obj.checkRenderDuration(); clear renderCleanup; obj.Rendering=false;
             drawnow limitrate;
         end
         function result=saveSnapshot(obj,directory)
@@ -100,26 +133,59 @@ classdef BusDrivingSystemDashboard < handle
         function value=getGraphicsDiagnostics(obj)
             value=struct('rawLines',obj.RawLines,'filteredLines',obj.FilteredLines, ...
                 'markerScatters',obj.MarkerScatters,'thresholdLines',obj.ThresholdLines, ...
-                'qualityLines',obj.QualityLines,'maximumRenderedPointsPerSeries',obj.Config.maximumRenderedPointsPerSeries);
+                'qualityLines',obj.QualityLines,'maximumRenderedPointsPerSeries',obj.Config.maximumRenderedPointsPerSeries, ...
+                'eventTable',obj.EventTable,'logTable',obj.LogTable, ...
+                'lastRenderedRevisions',obj.LastRenderedRevisions);
         end
-        function close(obj)
-            if obj.Closing, return; end
+        function selectTab(obj,title)
+            if isempty(obj.TabGroup) || ~isvalid(obj.TabGroup), return; end
+            tabs=obj.TabGroup.Children;
+            for index=1:numel(tabs)
+                if string(tabs(index).Title)==string(title), obj.TabGroup.SelectedTab=tabs(index); return; end
+            end
+            error('IMU:UnknownDashboardTab','Unknown dashboard tab: %s.',string(title));
+        end
+        function result=requestClose(obj)
+            result="cancelled"; if obj.IsClosed, result="closed"; return; end
+            status=obj.Controller.getStatus();
+            if obj.field(status,'isAcceptanceRunning',false)
+                choice=obj.confirmClose('Hardware acceptance is active and cannot be cancelled safely.', ...
+                    {'Leave acceptance running','Cancel close'},2,2);
+                if strcmp(choice,'Leave acceptance running'), obj.close(false); result="detached"; end
+                return;
+            end
+            if obj.field(status,'isCalibrationRunning',false)
+                choice=obj.confirmClose('Calibration is active.', ...
+                    {'Cancel calibration and close','Leave calibration running','Cancel'},1,3);
+                if strcmp(choice,'Cancel'), return; end
+                if strcmp(choice,'Leave calibration running'), obj.close(false); result="detached"; return; end
+            elseif obj.field(status,'isRealtimeRunning',false)
+                choice=obj.confirmClose('Real-time monitoring is active.', ...
+                    {'Stop system and close','Leave system running','Cancel'},1,3);
+                if strcmp(choice,'Cancel'), return; end
+                if strcmp(choice,'Leave system running'), obj.close(false); result="detached"; return; end
+            end
+            obj.close(obj.Config.closeStopsSystem); result="closed";
+        end
+        function close(obj,stopSystem)
+            if nargin<2, stopSystem=obj.Config.closeStopsSystem; end
+            if obj.Closing || obj.IsClosed, return; end
             obj.Closing=true; cleanup=onCleanup(@()obj.resetClosing());
             obj.stopTimer();
-            if obj.Config.closeStopsSystem
+            if stopSystem
                 obj.Controller.close();
             end
             if ~isempty(obj.Figure) && isvalid(obj.Figure)
                 obj.Figure.CloseRequestFcn=[]; delete(obj.Figure);
             end
-            obj.Figure=[]; clear cleanup; obj.Closing=false;
+            obj.Figure=[]; obj.IsClosed=true; clear cleanup; obj.Closing=false;
         end
         function delete(obj), obj.close(); end
     end
     methods(Access=private)
         function buildUi(obj)
             obj.Figure=uifigure('Name','Bus driving system','Position',[50 50 1500 900], ...
-                'CloseRequestFcn',@(~,~)obj.handleCloseRequest());
+                'CloseRequestFcn',@(~,~)obj.requestClose());
             root=uigridlayout(obj.Figure,[3 1]); root.RowHeight={95,'1x',80}; root.Padding=[8 8 8 8];
             pipeline=uigridlayout(root,[3 10]); pipeline.RowHeight={22,18,'1x'}; pipeline.ColumnWidth=repmat({'1x'},1,10);
             stages=["Bootstrap","Class API","IMU","Preflight","Calibration","Verification","Realtime","Recording","Stopping","Result"];
@@ -135,12 +201,15 @@ classdef BusDrivingSystemDashboard < handle
                     'BackgroundColor',[.94 .94 .94]);
                 obj.StageLabels(k).Layout.Row=3; obj.StageLabels(k).Layout.Column=k;
             end
-            tabs=uitabgroup(root); overview=uitab(tabs,'Title','Overview'); signals=uitab(tabs,'Title','Signals');
+            tabs=uitabgroup(root,'SelectionChangedFcn',@(~,~)obj.renderSafely(false)); obj.TabGroup=tabs;
+            overview=uitab(tabs,'Title','Overview'); signals=uitab(tabs,'Title','Signals');
             events=uitab(tabs,'Title','Events'); quality=uitab(tabs,'Title','Data quality');
             if obj.Config.enableCalibrationTab, calibration=uitab(tabs,'Title','Calibration'); else, calibration=[]; end
             if obj.Config.enableRecordingTab, recording=uitab(tabs,'Title','Recording'); else, recording=[]; end
             if obj.Config.enableAcceptanceTab, acceptance=uitab(tabs,'Title','Hardware acceptance'); else, acceptance=[]; end
             logTab=uitab(tabs,'Title','Log');
+            obj.Tabs=struct('Overview',overview,'Signals',signals,'Events',events,'Quality',quality, ...
+                'Calibration',calibration,'Recording',recording,'Acceptance',acceptance,'Log',logTab);
             og=uigridlayout(overview,[2 1]); og.RowHeight={55,'1x'};
             obj.StatusLabel=uilabel(og,'Text','SYSTEM IDLE','FontSize',24,'FontWeight','bold','HorizontalAlignment','center');
             obj.OverviewTable=uitable(og,'ColumnName',{'Field','Value'},'ColumnEditable',[false false]);
@@ -201,7 +270,7 @@ classdef BusDrivingSystemDashboard < handle
             end
             lg=uigridlayout(logTab,[2 1]); lg.RowHeight={30,'1x'};
             obj.LogFilter=uidropdown(lg,'Items',{'All','Lifecycle','Events','Warnings','Errors','Operator'}, ...
-                'Value','All','ValueChangedFcn',@(~,~)obj.renderSafely());
+                'Value','All','ValueChangedFcn',@(~,~)obj.renderSafely(false));
             obj.LogTable=uitable(lg,'ColumnName',{'Timestamp','Severity','Source','Stage','Type','Message'});
             controls=uigridlayout(root,[2 5]); controls.RowHeight={'1x','1x'}; controls.ColumnWidth=repmat({'1x'},1,5);
             labels={"Start system","Preflight","Start calibration","Confirm","Reject", ...
@@ -210,7 +279,7 @@ classdef BusDrivingSystemDashboard < handle
                 @(~,~)obj.Controller.startCalibration(),@(~,~)obj.Controller.confirmCurrentStep(), ...
                 @(~,~)obj.Controller.rejectCurrentStep(),@(~,~)obj.Controller.startRealtime(), ...
                 @(~,~)obj.Controller.stopRealtime(),@(~,~)obj.Controller.runFullAcceptance(), ...
-                @(~,~)obj.saveSnapshot(),@(~,~)obj.close()};
+                @(~,~)obj.saveSnapshot(),@(~,~)obj.requestClose()};
             obj.Controls=gobjects(10,1);
             for k=1:10, obj.Controls(k)=uibutton(controls,'Text',labels{k},'ButtonPushedFcn',callbacks{k}); end
         end
@@ -287,7 +356,7 @@ classdef BusDrivingSystemDashboard < handle
             data=cell(numel(fields)+1,2); data(1,:)={'status',obj.displayValue(obj.qualityStatus(c))};
             for k=1:numel(fields), data(k+1,:)={fields{k},obj.field(c,fields{k},0)}; end
             obj.setTableData(obj.QualityTable,data);
-            history=s.signalHistory;
+            history=obj.field(s,'signalHistory',struct.empty(0,1));
             if ~isempty(history)
                 x=obj.vector(history,'elapsedSeconds'); age=obj.vector(history,'callbackAgeMs'); quality=obj.vector(history,'dataQuality');
                 indices=obj.decimationIndices(numel(x)); x=x(indices); age=age(indices); quality=quality(indices);
@@ -324,7 +393,10 @@ classdef BusDrivingSystemDashboard < handle
         end
         function renderAcceptance(obj,s)
             if ~obj.Config.enableAcceptanceTab || isempty(obj.AcceptanceTable), return; end
-            stages=s.stageHistory; data=cell(numel(stages),4);
+            stages=obj.field(s,'stageHistory',struct.empty(0,1));
+            current=obj.field(s,'currentStageRecord',struct());
+            if isempty(stages) && isstruct(current) && isfield(current,'stage'), stages=current; end
+            data=cell(numel(stages),4);
             for k=1:numel(stages), data(k,:)={obj.displayValue(obj.field(stages(k),'stage',"")),obj.displayValue(obj.field(stages(k),'state',"")), ...
                     obj.field(stages(k),'progress',0),obj.displayValue(obj.field(stages(k),'message',""))}; end
             summary=s.acceptance;
@@ -356,17 +428,19 @@ classdef BusDrivingSystemDashboard < handle
                     obj.displayValue(obj.field(log(k),'type',"")),obj.displayValue(obj.field(log(k),'message',""))}; end
             obj.setTableData(obj.LogTable,data);
         end
-        function updateControls(obj,state)
-            state=string(state); enabled=false(10,1);
-            enabled(1)=any(state==["IDLE","STOPPED","COMPLETED"]); enabled(2)=state=="CONNECTING_IMU";
-            enabled(3)=any(state==["CALIBRATION_REQUIRED","READY"]); enabled(4:5)=any(state==["CALIBRATING","CALIBRATION_VERIFYING"]);
-            enabled(6)=any(state==["READY","STOPPED"]); enabled(7)=state=="STREAMING";
-            enabled(8)=state~="STREAMING"; enabled(9)=true; enabled(10)=true;
+        function updateControls(obj,status)
+            actions=obj.field(status,'actions',struct()); names={'canStartSystem','canRunPreflight', ...
+                'canStartCalibration','canConfirmCalibration','canRejectCalibration','canStartRealtime', ...
+                'canStopRealtime','canRunAcceptance','canSaveSnapshot','canClose'};
+            enabled=false(10,1);
+            for k=1:10, enabled(k)=logical(obj.field(actions,names{k},false)); end
             for k=1:10
                 if enabled(k), obj.Controls(k).Enable='on'; else, obj.Controls(k).Enable='off'; end
             end
         end
-        function renderSafely(obj)
+        function renderSafely(obj,isTimerTick)
+            if nargin<2, isTimerTick=false; end
+            if isTimerTick, obj.recordRenderTick(); end
             try, obj.render(); catch exception
                 warning('IMU:SystemDashboardRenderFailed','Dashboard render failed: %s',exception.message);
             end
@@ -377,46 +451,6 @@ classdef BusDrivingSystemDashboard < handle
             if isvalid(value), stop(value); delete(value); end
         end
         function resetClosing(obj), obj.Closing=false; end
-        function handleCloseRequest(obj)
-            status=obj.Controller.getStatus();
-            if ~usejava('desktop') && (obj.field(status,'isAcceptanceRunning',false) || ...
-                    obj.field(status,'isCalibrationRunning',false) || obj.field(status,'isRealtimeRunning',false))
-                return;
-            end
-            if obj.field(status,'isAcceptanceRunning',false)
-                choice=uiconfirm(obj.Figure,'Hardware acceptance is active and cannot be cancelled safely.', ...
-                    'Close dashboard','Options',{'Leave acceptance running','Cancel close'}, ...
-                    'DefaultOption',2,'CancelOption',2);
-                if strcmp(choice,'Cancel close'), return; end
-                previous=obj.Config.closeStopsSystem; obj.Config.closeStopsSystem=false;
-                cleanup=onCleanup(@()obj.restoreCloseOption(previous)); obj.close(); clear cleanup;
-                return;
-            end
-            if obj.field(status,'isCalibrationRunning',false)
-                choice=uiconfirm(obj.Figure,'Calibration is active.', ...
-                    'Close dashboard','Options',{'Cancel calibration and close','Leave calibration running','Cancel'}, ...
-                    'DefaultOption',1,'CancelOption',3);
-                if strcmp(choice,'Cancel'), return; end
-                if strcmp(choice,'Leave calibration running')
-                    previous=obj.Config.closeStopsSystem; obj.Config.closeStopsSystem=false;
-                    cleanup=onCleanup(@()obj.restoreCloseOption(previous)); obj.close(); clear cleanup;
-                    return;
-                end
-            end
-            if status.isRealtimeRunning
-                choice=uiconfirm(obj.Figure,'Real-time monitoring is active.', ...
-                    'Close dashboard','Options',{'Stop system and close','Leave system running','Cancel'}, ...
-                    'DefaultOption',1,'CancelOption',3);
-                if strcmp(choice,'Cancel'), return; end
-                if strcmp(choice,'Leave system running')
-                    previous=obj.Config.closeStopsSystem; obj.Config.closeStopsSystem=false;
-                    cleanup=onCleanup(@()obj.restoreCloseOption(previous)); obj.close(); clear cleanup;
-                    return;
-                end
-            end
-            obj.close();
-        end
-        function restoreCloseOption(obj,value), obj.Config.closeStopsSystem=value; end
         function resumeRenderTimer(obj,shouldResume)
             if shouldResume && ~isempty(obj.RenderTimer) && isvalid(obj.RenderTimer)
                 start(obj.RenderTimer);
@@ -493,10 +527,15 @@ classdef BusDrivingSystemDashboard < handle
             if ~isequaln(handle.Data,data), handle.Data=data; end
         end
         function setDisplayOption(obj,name,value)
-            obj.Config.(name)=logical(value); obj.renderSafely();
+            obj.Config.(name)=logical(value); obj.LastRenderedRevisions=struct(); obj.renderSafely(false);
         end
         function elapsed=stageElapsed(obj,s,name)
-            elapsed=0; stages=s.stageHistory;
+            elapsed=0;
+            current=obj.field(s,'currentStageRecord',struct());
+            if isstruct(current) && isfield(current,'stage') && string(current.stage)==name
+                elapsed=double(obj.field(current,'elapsedSeconds',0)); return;
+            end
+            stages=obj.field(s,'stageHistory',struct.empty(0,1));
             for index=numel(stages):-1:1
                 if string(obj.field(stages(index),'stage',""))==name
                     elapsed=double(obj.field(stages(index),'elapsedSeconds',0)); return;
@@ -504,6 +543,7 @@ classdef BusDrivingSystemDashboard < handle
             end
         end
         function checkRenderDuration(obj)
+            if obj.RenderCount==0, return; end
             if obj.LastRenderMilliseconds<=obj.Config.maximumRenderMilliseconds, return; end
             nowValue=obj.Dependencies.nowUtc();
             if ~isnat(obj.LastRenderWarningAt) && seconds(nowValue-obj.LastRenderWarningAt)<10, return; end
@@ -520,7 +560,8 @@ classdef BusDrivingSystemDashboard < handle
         function dependencies=mergeDependencies(~,custom)
             defaults=struct('createTimer',@timer,'nowUtc',@()datetime('now','TimeZone','UTC'), ...
                 'exportPng',@exportDashboardPng, ...
-                'writeJson',@writeDashboardJson,'saveMat',@saveDashboardMat);
+                'writeJson',@writeDashboardJson,'saveMat',@saveDashboardMat, ...
+                'confirmClose',@confirmDashboardClose);
             if ~isstruct(custom) || ~isscalar(custom)
                 error('IMU:InvalidDashboardDependencies','Dashboard dependencies must be a scalar struct.');
             end
@@ -551,14 +592,67 @@ classdef BusDrivingSystemDashboard < handle
                     "FINAL_STATS","FINALIZING_EVENTS","FINALIZING_RECORDING","CLEARING_BUFFER","RELEASING_OWNER"]), value="STOPPING";
             elseif state=="STREAMING" && obj.qualityStatus(s.callback)~="GOOD", value="DEGRADED DATA";
             elseif state=="STREAMING", value="STREAMING"; elseif state=="READY", value="SYSTEM READY"; else, value="SYSTEM "+state; end
+            if obj.UiDegraded, value="UI DEGRADED - "+value; end
         end
         function completed=completedStages(obj,s)
-            completed=strings(0,1); stages=s.stageHistory;
+            completed=string(obj.field(s,'completedStages',strings(0,1)));
+            completed=reshape(completed,[],1); stages=obj.field(s,'stageHistory',struct.empty(0,1));
             for k=1:numel(stages)
                 if isfield(stages(k),'state') && string(stages(k).state)=="PASSED"
                     completed(end+1,1)=obj.pipelineStageName(string(stages(k).stage));
                 end
             end
+            for k=1:numel(completed), completed(k)=obj.pipelineStageName(completed(k)); end
+        end
+        function finishRendering(obj), obj.Rendering=false; end
+        function title=selectedTabTitle(obj)
+            title="Overview";
+            if ~isempty(obj.TabGroup) && isvalid(obj.TabGroup) && ~isempty(obj.TabGroup.SelectedTab)
+                title=string(obj.TabGroup.SelectedTab.Title);
+            end
+        end
+        function changed=revisionChanged(obj,snapshot,name)
+            revision=double(obj.field(snapshot,name,-1));
+            key=matlab.lang.makeValidName(char(obj.selectedTabTitle()+"_"+string(name)));
+            changed=~isfield(obj.LastRenderedRevisions,key) || obj.LastRenderedRevisions.(key)~=revision;
+            if changed, obj.LastRenderedRevisions.(key)=revision; end
+        end
+        function changed=revisionChangedAny(obj,snapshot,names)
+            changed=false;
+            for index=1:numel(names), changed=obj.revisionChanged(snapshot,names{index}) || changed; end
+        end
+        function recordRenderDuration(obj,duration)
+            if obj.RenderCount==0, obj.InitialRenderMilliseconds=duration; return; end
+            obj.RenderDurationHistory(end+1,1)=duration;
+            if numel(obj.RenderDurationHistory)>200, obj.RenderDurationHistory=obj.RenderDurationHistory(end-199:end); end
+            obj.RenderP50Milliseconds=obj.percentile(obj.RenderDurationHistory,50);
+            obj.RenderP95Milliseconds=obj.percentile(obj.RenderDurationHistory,95);
+            obj.MaximumSteadyStateRenderMilliseconds=max(obj.MaximumSteadyStateRenderMilliseconds,duration);
+            if duration>200
+                obj.CurrentConsecutiveDeadlineMisses=obj.CurrentConsecutiveDeadlineMisses+1;
+            else
+                obj.CurrentConsecutiveDeadlineMisses=0;
+            end
+            obj.ConsecutiveDeadlineMisses=max(obj.ConsecutiveDeadlineMisses,obj.CurrentConsecutiveDeadlineMisses);
+            if obj.RenderP95Milliseconds>100 || obj.CurrentConsecutiveDeadlineMisses>=2, obj.UiDegraded=true; end
+        end
+        function recordRenderTick(obj)
+            nowValue=obj.Dependencies.nowUtc(); period=1/obj.Config.refreshHz;
+            if ~isnat(obj.LastRenderTickAt)
+                missed=max(0,floor(seconds(nowValue-obj.LastRenderTickAt)/period)-1);
+                obj.DroppedRenderTicks=obj.DroppedRenderTicks+missed;
+            end
+            obj.LastRenderTickAt=nowValue;
+        end
+        function value=percentile(~,values,percent)
+            values=sort(values(isfinite(values)));
+            if isempty(values), value=NaN; return; end
+            position=1+(numel(values)-1)*percent/100; lower=floor(position); upper=ceil(position);
+            value=values(lower)+(position-lower)*(values(upper)-values(lower));
+        end
+        function choice=confirmClose(obj,message,options,defaultOption,cancelOption)
+            choice=obj.Dependencies.confirmClose(obj.Figure,message,options,defaultOption,cancelOption);
+            choice=char(string(choice));
         end
         function value=pipelineStageName(~,value)
             switch lower(string(value))
@@ -588,4 +682,12 @@ end
 
 function exportDashboardPng(figureHandle,filename)
 exportapp(figureHandle,filename);
+end
+
+function choice=confirmDashboardClose(figureHandle,message,options,defaultOption,cancelOption)
+if ~usejava('desktop') || isempty(figureHandle) || ~isvalid(figureHandle)
+    choice=options{cancelOption}; return;
+end
+choice=uiconfirm(figureHandle,message,'Close dashboard','Options',options, ...
+    'DefaultOption',defaultOption,'CancelOption',cancelOption);
 end

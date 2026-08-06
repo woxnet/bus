@@ -315,11 +315,21 @@ user-callback failure is isolated from acquisition. `RealtimeDrivingMonitor`
 remains the sole FIFO consumer. Displayed driving events are diagnostic
 candidates, not a driver score or a disciplinary conclusion.
 
-Run the hardware-free demonstration with:
+Start the hardware-free demonstration asynchronously with:
+
+```matlab
+[syntheticController, syntheticDashboard] = ...
+    run_synthetic_system_visualization_demo();
+```
+
+This returns immediately while the fixed-spacing simulation timer continues.
+For a blocking run with a completed summary, use:
 
 ```matlab
 [syntheticController, syntheticDashboard, summary] = ...
-    run_synthetic_system_visualization_demo();
+    run_synthetic_system_visualization_demo(true, ...
+        struct("WaitForCompletion", true));
+% Or: summary = runSyntheticSystemVisualizationDemoBlocking();
 ```
 
 It is labelled `SYNTHETIC DEMONSTRATION — NOT A HARDWARE ACCEPTANCE` and
@@ -327,4 +337,4 @@ simulates 60 seconds containing calibration, verification, braking, turn and
 vertical-shock candidates, degraded data, a recording guard, safe stop, and a
 completed acceptance. The desktop-only visual smoke test is intentionally not
 part of normal CI and can be run manually with
-`runSystemDashboardVisualSmokeTest` after adding `tests` to the path.
+`runSystemDashboardVisualSmokeTest`.

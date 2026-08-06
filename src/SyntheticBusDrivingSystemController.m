@@ -58,8 +58,16 @@ classdef SyntheticBusDrivingSystemController < handle
                 'mode',"synthetic",'startedAt',NaT,'completedAt',NaT,'lastError',[], ...
                 'isRealtimeRunning',obj.State=="STREAMING",'isCalibrationRunning',obj.State=="CALIBRATING", ...
                 'isAcceptanceRunning',obj.State=="RUNNING_ACCEPTANCE",'isClosed',false,'isConnected',false);
+            state=obj.State; running=obj.IsSimulationRunning;
+            status.actions=struct('canStartSystem',~running && any(state==["IDLE","STOPPED","COMPLETED"]), ...
+                'canRunPreflight',false,'canStartCalibration',false,'canConfirmCalibration',false, ...
+                'canRejectCalibration',false,'canStartRealtime',false,'canStopRealtime',state=="STREAMING", ...
+                'canRunAcceptance',false,'canSaveSnapshot',true,'canClose',true);
         end
         function snapshot=getTelemetrySnapshot(obj), snapshot=obj.TelemetryHub.getSnapshot(); end
+        function snapshot=getSummarySnapshot(obj)
+            snapshot=obj.TelemetryHub.getSummarySnapshot(); status=obj.getStatus(); snapshot.actions=status.actions;
+        end
         function startSystem(obj), obj.setState("BOOTSTRAP","Bootstrap"); end
         function runPreflight(obj), obj.setState("PREFLIGHT","Preflight"); end
         function startCalibration(obj), obj.setState("CALIBRATING","Calibration"); end

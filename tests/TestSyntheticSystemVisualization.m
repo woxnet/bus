@@ -4,9 +4,8 @@ classdef TestSyntheticSystemVisualization < matlab.unittest.TestCase
     end
     methods(Test)
         function demoCoversSixtySecondsWithoutHardware(testCase)
-            [controller,dashboard,summary]=run_synthetic_system_visualization_demo(false);
-            testCase.addTeardown(@()delete(dashboard)); controller.waitForCompletion(10);
-            summary=controller.getSimulationSummary(); snapshot=controller.getTelemetrySnapshot();
+            [controller,dashboard,summary]=run_synthetic_system_visualization_demo(false,struct('WaitForCompletion',true));
+            testCase.addTeardown(@()delete(dashboard)); snapshot=controller.getTelemetrySnapshot();
             testCase.verifyTrue(summary.success); testCase.verifyGreaterThanOrEqual(summary.durationSeconds,60);
             testCase.verifyEqual(numel(snapshot.recentEvents),3); testCase.verifyNotEmpty(snapshot.warnings);
             testCase.verifyEqual(snapshot.mode,"synthetic");
@@ -14,6 +13,17 @@ classdef TestSyntheticSystemVisualization < matlab.unittest.TestCase
             testCase.verifyTrue(all(ismember(["BOOTSTRAP","PREFLIGHT","CALIBRATION_REQUIRED","CALIBRATING", ...
                 "CALIBRATION_VERIFYING","STREAMING","STOP_DEFERRED","QUIESCING","DRAINING_TAIL", ...
                 "RELEASING_OWNER","STOPPED","RUNNING_ACCEPTANCE","COMPLETED"],controller.TransitionHistory)));
+        end
+        function asynchronousApiDoesNotReturnFalseSummary(testCase)
+            [controller,dashboard,summary]=run_synthetic_system_visualization_demo(false);
+            testCase.addTeardown(@()delete(dashboard));
+            testCase.verifyEmpty(summary); testCase.verifyTrue(controller.IsSimulationRunning);
+            testCase.verifyFalse(controller.IsSimulationComplete);
+        end
+        function blockingHelperReturnsCompletedSuccess(testCase)
+            [summary,controller,dashboard]=runSyntheticSystemVisualizationDemoBlocking(false);
+            testCase.addTeardown(@()delete(dashboard));
+            testCase.verifyTrue(summary.success); testCase.verifyTrue(controller.IsSimulationComplete);
         end
     end
 end

@@ -47,7 +47,7 @@ classdef BusDrivingSystemController < handle
             if nargin<2, dependencies=struct(); end
             obj.Options=obj.mergeOptions(options);
             obj.Dependencies=obj.mergeDependencies(dependencies);
-            obj.TelemetryHub=BusDrivingSystemTelemetryHub(obj.Options.dashboardConfig);
+            obj.TelemetryHub=BusDrivingSystemTelemetryHub(obj.Options.dashboardConfig,obj.Dependencies.nowUtc);
         end
         function startSystem(obj)
             obj.requireState(["IDLE","STOPPED","COMPLETED"]);
@@ -135,10 +135,15 @@ classdef BusDrivingSystemController < handle
             end
         end
         function runFullAcceptance(obj)
-            if obj.monitorActive(), error('IMU:SystemBusy','Stop real-time monitoring before acceptance.'); end
+            if obj.IsClosed, error('IMU:SystemControllerClosed','Closed controller cannot run acceptance.'); end
+            if obj.AcceptanceRunning, error('IMU:AcceptanceAlreadyRunning','Hardware acceptance is already running.'); end
+            allowed=["IDLE","READY","STOPPED","COMPLETED"];
+            if obj.monitorActive() || obj.calibrationActive() || ~any(obj.State==allowed)
+                error('IMU:SystemBusy','Controller state %s cannot run hardware acceptance.',obj.State);
+            end
             obj.Mode="acceptance";
-            obj.transition("RUNNING_ACCEPTANCE","Hardware acceptance",0,"Hardware acceptance started.");
             obj.AcceptanceRunning=true; acceptanceCleanup=onCleanup(@()obj.clearAcceptanceRunning());
+            obj.transition("RUNNING_ACCEPTANCE","Hardware acceptance",0,"Hardware acceptance started.");
             try
                 options=struct('Observer',@(event)obj.onAcceptanceEvent(event));
                 obj.AcceptanceResult=obj.Dependencies.runAcceptance(options);
@@ -165,8 +170,11 @@ classdef BusDrivingSystemController < handle
         end
         function close(obj)
             if obj.IsClosed, return; end
+            if obj.AcceptanceRunning
+                error('IMU:AcceptanceInProgress','Cannot close controller while hardware acceptance is running.');
+            end
             if obj.monitorActive(), obj.stopRealtime(); end
-            if ~isempty(obj.CalibrationController) && obj.CalibrationController.IsRunning
+            if obj.calibrationActive()
                 obj.CalibrationController.close();
             end
             obj.clearOwnedCallbacks(); obj.disconnectImu();
@@ -179,11 +187,16 @@ classdef BusDrivingSystemController < handle
                 'startedAt',obj.StartedAt,'completedAt',obj.CompletedAt,'lastError',obj.LastError, ...
                 'isRealtimeRunning',obj.monitorActive());
             status.isClosed=obj.IsClosed; status.isConnected=obj.IsConnected;
-            status.isCalibrationRunning=~isempty(obj.CalibrationController) && obj.CalibrationController.IsRunning;
+            status.isCalibrationRunning=obj.calibrationActive();
             status.isAcceptanceRunning=obj.AcceptanceRunning;
+            status.actions=obj.actionModel();
         end
         function snapshot=getTelemetrySnapshot(obj)
             snapshot=obj.TelemetryHub.getSnapshot();
+        end
+        function snapshot=getSummarySnapshot(obj)
+            snapshot=obj.TelemetryHub.getSummarySnapshot();
+            snapshot.actions=obj.actionModel();
         end
         function delete(obj), obj.close(); end
     end
@@ -306,8 +319,14 @@ classdef BusDrivingSystemController < handle
             end
         end
         function fail(obj,exception)
-            obj.LastError=exception; obj.State="FAILED"; obj.Message=string(exception.message);
-            obj.TelemetryHub.ingestError(exception); obj.emit(obj.OnError,exception); obj.emit(obj.OnStateChanged,obj.getStatus());
+            if obj.State=="FAILED" && ~isempty(obj.LastError) && ...
+                    strcmp(obj.LastError.identifier,exception.identifier) && strcmp(obj.LastError.message,exception.message)
+                return;
+            end
+            obj.State="FAILED"; obj.CompletedAt=obj.nowUtc(); obj.Message=string(exception.message); obj.LastError=exception;
+            status=obj.getStatus(); status.severity="error";
+            obj.TelemetryHub.ingestError(exception); obj.TelemetryHub.ingestState(status);
+            obj.emit(obj.OnError,exception); obj.emit(obj.OnStateChanged,status); obj.emitTelemetry();
         end
         function requireState(obj,allowed)
             if ~any(obj.State==allowed), error('IMU:InvalidSystemState','Action is not valid in state %s.',obj.State); end
@@ -317,6 +336,26 @@ classdef BusDrivingSystemController < handle
             if isempty(obj.RealtimeMonitor) || ~isvalid(obj.RealtimeMonitor), return; end
             status=obj.RealtimeMonitor.getStatus();
             active=obj.RealtimeMonitor.IsRunning || status.isStopping;
+        end
+        function active=calibrationActive(obj)
+            active=false;
+            if isempty(obj.CalibrationController) || ~isvalid(obj.CalibrationController), return; end
+            active=logical(obj.CalibrationController.IsRunning);
+        end
+        function actions=actionModel(obj)
+            state=string(obj.State); closed=obj.IsClosed; monitor=obj.monitorActive();
+            calibration=obj.calibrationActive(); acceptance=obj.AcceptanceRunning;
+            actions=struct();
+            actions.canStartSystem=~closed && ~acceptance && any(state==["IDLE","STOPPED","COMPLETED"]);
+            actions.canRunPreflight=~closed && ~acceptance && any(state==["CONNECTING_IMU","PREFLIGHT","STOPPED"]);
+            actions.canStartCalibration=~closed && ~monitor && ~acceptance && any(state==["CALIBRATION_REQUIRED","READY"]);
+            actions.canConfirmCalibration=~closed && calibration && any(state==["CALIBRATING","CALIBRATION_VERIFYING"]);
+            actions.canRejectCalibration=actions.canConfirmCalibration;
+            actions.canStartRealtime=~closed && ~monitor && ~calibration && ~acceptance && any(state==["READY","STOPPED"]);
+            actions.canStopRealtime=~closed && monitor;
+            actions.canRunAcceptance=~closed && ~monitor && ~calibration && ~acceptance && any(state==["IDLE","READY","STOPPED","COMPLETED"]);
+            actions.canSaveSnapshot=~closed;
+            actions.canClose=~closed;
         end
         function logOperator(obj,type,message)
             obj.TelemetryHub.ingestStage(struct('timestamp',obj.nowUtc(),'type',"operator_"+string(type), ...
