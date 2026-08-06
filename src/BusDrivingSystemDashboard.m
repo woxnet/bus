@@ -18,6 +18,11 @@ classdef BusDrivingSystemDashboard < handle
         ConsecutiveDeadlineMisses=0
         UiDegraded=false
         IsClosed=false
+        TabRenderCounts=struct()
+        DetectorActivationObserved=false
+        EventMarkerObserved=false
+        RenderFailureCount=0
+        RenderRetrySuccessCount=0
     end
     properties(Access=private)
         RenderTimer=[]
@@ -54,6 +59,7 @@ classdef BusDrivingSystemDashboard < handle
         Rendering=false
         LastRenderTickAt=NaT
         CurrentConsecutiveDeadlineMisses=0
+        RetryPending=false
     end
     methods
         function obj=BusDrivingSystemDashboard(controller,config,dependencies)
@@ -75,25 +81,49 @@ classdef BusDrivingSystemDashboard < handle
             if isempty(obj.Figure) || ~isvalid(obj.Figure), return; end
             if obj.Rendering, obj.DroppedRenderTicks=obj.DroppedRenderTicks+1; return; end
             obj.Rendering=true; renderCleanup=onCleanup(@()obj.finishRendering()); started=tic;
+            if ismethod(obj.Controller,'refreshRealtimeTelemetry')
+                obj.Controller.refreshRealtimeTelemetry();
+            end
             if ismethod(obj.Controller,'getSummarySnapshot'), summary=obj.Controller.getSummarySnapshot();
             else, summary=obj.Controller.getTelemetrySnapshot(); end
             obj.LastSnapshot=summary; obj.renderPipeline(summary); obj.renderOverview(summary); obj.updateControls(summary);
             selected=obj.selectedTabTitle(); full=[];
+            obj.recordTabRender(selected);
+            obj.Dependencies.beforeTabRender(selected,summary);
             switch selected
                 case "Signals"
-                    if obj.revisionChanged(summary,'signalRevision'), full=obj.Controller.getTelemetrySnapshot(); obj.renderSignals(full); end
+                    if obj.revisionNeedsRender(summary,'signalRevision')
+                        full=obj.Controller.getTelemetrySnapshot(); obj.renderSignals(full);
+                        obj.commitRenderedRevision(summary,'signalRevision');
+                    end
                 case "Events"
-                    if obj.revisionChanged(summary,'eventRevision'), full=obj.Controller.getTelemetrySnapshot(); obj.renderEvents(full); end
+                    if obj.revisionNeedsRender(summary,'eventRevision')
+                        full=obj.Controller.getTelemetrySnapshot(); obj.renderEvents(full);
+                        obj.commitRenderedRevision(summary,'eventRevision');
+                    end
                 case "Data quality"
-                    if obj.revisionChanged(summary,'signalRevision'), obj.renderQuality(summary); end
+                    if obj.revisionNeedsRender(summary,'signalRevision')
+                        full=obj.Controller.getTelemetrySnapshot(); obj.renderQuality(full);
+                        obj.commitRenderedRevision(summary,'signalRevision');
+                    end
                 case "Calibration"
-                    if obj.revisionChanged(summary,'calibrationRevision'), obj.renderCalibration(summary); end
+                    if obj.revisionNeedsRender(summary,'calibrationRevision')
+                        obj.renderCalibration(summary); obj.commitRenderedRevision(summary,'calibrationRevision');
+                    end
                 case "Recording"
-                    if obj.revisionChanged(summary,'signalRevision'), obj.renderRecording(summary); end
+                    if obj.revisionNeedsRender(summary,'signalRevision')
+                        obj.renderRecording(summary); obj.commitRenderedRevision(summary,'signalRevision');
+                    end
                 case "Hardware acceptance"
-                    if obj.revisionChangedAny(summary,{'stageRevision','acceptanceRevision'}), obj.renderAcceptance(summary); end
+                    names={'stageRevision','acceptanceRevision'};
+                    if obj.revisionNeedsRenderAny(summary,names)
+                        obj.renderAcceptance(summary); obj.commitRenderedRevisions(summary,names);
+                    end
                 case "Log"
-                    if obj.revisionChanged(summary,'logRevision'), full=obj.Controller.getTelemetrySnapshot(); obj.renderLog(full); end
+                    if obj.revisionNeedsRender(summary,'logRevision')
+                        full=obj.Controller.getTelemetrySnapshot(); obj.renderLog(full);
+                        obj.commitRenderedRevision(summary,'logRevision');
+                    end
             end
             if ~isempty(full), obj.LastSnapshot=full; end
             obj.LastRenderMilliseconds=1000*toc(started); obj.recordRenderDuration(obj.LastRenderMilliseconds);
@@ -134,7 +164,13 @@ classdef BusDrivingSystemDashboard < handle
             value=struct('rawLines',obj.RawLines,'filteredLines',obj.FilteredLines, ...
                 'markerScatters',obj.MarkerScatters,'thresholdLines',obj.ThresholdLines, ...
                 'qualityLines',obj.QualityLines,'maximumRenderedPointsPerSeries',obj.Config.maximumRenderedPointsPerSeries, ...
-                'eventTable',obj.EventTable,'logTable',obj.LogTable, ...
+                'overviewTable',obj.OverviewTable,'eventTable',obj.EventTable,'detectorTable',obj.DetectorTable, ...
+                'qualityTable',obj.QualityTable,'calibrationTable',obj.CalibrationTable, ...
+                'recordingTable',obj.RecordingTable,'acceptanceTable',obj.AcceptanceTable, ...
+                'logTable',obj.LogTable,'calibrationQuivers',obj.CalibrationQuivers, ...
+                'recordingGauges',obj.RecordingGauges,'tabRenderCounts',obj.TabRenderCounts, ...
+                'detectorActivationObserved',obj.DetectorActivationObserved, ...
+                'eventMarkerObserved',obj.EventMarkerObserved, ...
                 'lastRenderedRevisions',obj.LastRenderedRevisions);
         end
         function selectTab(obj,title)
@@ -180,7 +216,21 @@ classdef BusDrivingSystemDashboard < handle
             end
             obj.Figure=[]; obj.IsClosed=true; clear cleanup; obj.Closing=false;
         end
-        function delete(obj), obj.close(); end
+        function delete(obj)
+            if obj.IsClosed, return; end
+            stopSystem=obj.Config.closeStopsSystem;
+            try
+                status=obj.Controller.getStatus();
+                if obj.field(status,'isAcceptanceRunning',false), stopSystem=false; end
+            catch
+                stopSystem=false;
+            end
+            try
+                obj.close(stopSystem);
+            catch
+                try, obj.close(false); catch, end
+            end
+        end
     end
     methods(Access=private)
         function buildUi(obj)
@@ -340,6 +390,7 @@ classdef BusDrivingSystemDashboard < handle
             types=["BRAKING_CANDIDATE","ACCELERATION_CANDIDATE","TURN_LEFT_CANDIDATE","TURN_RIGHT_CANDIDATE","VERTICAL_SHOCK_CANDIDATE"];
             states=repmat("IDLE",5,1);
             for k=1:numel(s.activeEvents), if isfield(s.activeEvents(k),'type'), states(types==string(s.activeEvents(k).type))="ACTIVE"; end, end
+            if any(states=="ACTIVE") || ~isempty(s.recentEvents), obj.DetectorActivationObserved=true; end
             obj.setTableData(obj.DetectorTable,[cellstr(types(:)),cellstr(states(:))]);
             e=s.recentEvents; data=cell(numel(e),10);
             for k=1:numel(e), data(k,:)={obj.displayValue(obj.field(e(k),'eventId',"")),obj.displayValue(obj.field(e(k),'type',"")), ...
@@ -441,7 +492,11 @@ classdef BusDrivingSystemDashboard < handle
         function renderSafely(obj,isTimerTick)
             if nargin<2, isTimerTick=false; end
             if isTimerTick, obj.recordRenderTick(); end
-            try, obj.render(); catch exception
+            try
+                obj.render();
+                if obj.RetryPending, obj.RenderRetrySuccessCount=obj.RenderRetrySuccessCount+1; obj.RetryPending=false; end
+            catch exception
+                obj.RenderFailureCount=obj.RenderFailureCount+1; obj.RetryPending=true;
                 warning('IMU:SystemDashboardRenderFailed','Dashboard render failed: %s',exception.message);
             end
         end
@@ -500,6 +555,7 @@ classdef BusDrivingSystemDashboard < handle
                 if isfinite(value) && value>=x(1) && value<=x(end), markerX(end+1)=value; end %#ok<AGROW>
             end
             if isempty(markerX), obj.setSeries(handle,[],[],false); return; end
+            obj.EventMarkerObserved=true;
             y=obj.vector(history,fieldName); markerY=interp1(x,y,markerX,'nearest','extrap');
             obj.setSeries(handle,markerX,markerY,true);
         end
@@ -561,7 +617,7 @@ classdef BusDrivingSystemDashboard < handle
             defaults=struct('createTimer',@timer,'nowUtc',@()datetime('now','TimeZone','UTC'), ...
                 'exportPng',@exportDashboardPng, ...
                 'writeJson',@writeDashboardJson,'saveMat',@saveDashboardMat, ...
-                'confirmClose',@confirmDashboardClose);
+                'confirmClose',@confirmDashboardClose,'beforeTabRender',@(~,~)[]);
             if ~isstruct(custom) || ~isscalar(custom)
                 error('IMU:InvalidDashboardDependencies','Dashboard dependencies must be a scalar struct.');
             end
@@ -611,15 +667,27 @@ classdef BusDrivingSystemDashboard < handle
                 title=string(obj.TabGroup.SelectedTab.Title);
             end
         end
-        function changed=revisionChanged(obj,snapshot,name)
+        function recordTabRender(obj,title)
+            key=matlab.lang.makeValidName(char(string(title)));
+            if ~isfield(obj.TabRenderCounts,key), obj.TabRenderCounts.(key)=0; end
+            obj.TabRenderCounts.(key)=obj.TabRenderCounts.(key)+1;
+        end
+        function changed=revisionNeedsRender(obj,snapshot,name)
             revision=double(obj.field(snapshot,name,-1));
             key=matlab.lang.makeValidName(char(obj.selectedTabTitle()+"_"+string(name)));
             changed=~isfield(obj.LastRenderedRevisions,key) || obj.LastRenderedRevisions.(key)~=revision;
-            if changed, obj.LastRenderedRevisions.(key)=revision; end
         end
-        function changed=revisionChangedAny(obj,snapshot,names)
+        function commitRenderedRevision(obj,snapshot,name)
+            revision=double(obj.field(snapshot,name,-1));
+            key=matlab.lang.makeValidName(char(obj.selectedTabTitle()+"_"+string(name)));
+            obj.LastRenderedRevisions.(key)=revision;
+        end
+        function changed=revisionNeedsRenderAny(obj,snapshot,names)
             changed=false;
-            for index=1:numel(names), changed=obj.revisionChanged(snapshot,names{index}) || changed; end
+            for index=1:numel(names), changed=obj.revisionNeedsRender(snapshot,names{index}) || changed; end
+        end
+        function commitRenderedRevisions(obj,snapshot,names)
+            for index=1:numel(names), obj.commitRenderedRevision(snapshot,names{index}); end
         end
         function recordRenderDuration(obj,duration)
             if obj.RenderCount==0, obj.InitialRenderMilliseconds=duration; return; end

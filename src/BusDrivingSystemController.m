@@ -16,6 +16,9 @@ classdef BusDrivingSystemController < handle
         CheckoutCommit=""
         IsClosed=false
         IsConnected=false
+        AcceptanceRunning=false
+        LastRuntimeTelemetryRefresh=-Inf
+        RuntimeTelemetryRefreshCount=0
     end
     properties
         OnStateChanged=[]
@@ -39,7 +42,8 @@ classdef BusDrivingSystemController < handle
         Dependencies
         Calibration=[]
         Preflight=[]
-        AcceptanceRunning=false
+        RuntimeTelemetryClock=[]
+        ActiveOperationStages=strings(0,1)
     end
     methods
         function obj=BusDrivingSystemController(options,dependencies)
@@ -48,20 +52,23 @@ classdef BusDrivingSystemController < handle
             obj.Options=obj.mergeOptions(options);
             obj.Dependencies=obj.mergeDependencies(dependencies);
             obj.TelemetryHub=BusDrivingSystemTelemetryHub(obj.Options.dashboardConfig,obj.Dependencies.nowUtc);
+            obj.RuntimeTelemetryClock=obj.Dependencies.monotonicClockStart();
         end
         function startSystem(obj)
-            obj.requireState(["IDLE","STOPPED","COMPLETED"]);
-            if obj.IsClosed, error('IMU:SystemControllerClosed','Closed controller cannot be restarted.'); end
+            obj.requireOpen(); obj.requireState(["IDLE","STOPPED","COMPLETED"]);
             if obj.IsConnected && ~isempty(obj.Imu), obj.disconnectImu(); end
             obj.StartedAt=obj.nowUtc(); obj.CompletedAt=NaT; obj.Mode="operation";
             try
+                obj.startStage("Bootstrap","Starting system.");
                 obj.transition("BOOTSTRAP","Bootstrap",0,"Starting system.");
                 obj.CheckoutCommit=string(obj.Dependencies.getCommit());
                 obj.TelemetryHub.updateMetadata(struct('checkoutCommit',obj.CheckoutCommit));
                 obj.completeStage("Bootstrap","Bootstrap complete.");
+                obj.startStage("Class API","Checking MATLAB class API.");
                 obj.transition("CHECKING_CLASS_API","Class API",0,"Checking MATLAB class API.");
                 if isfield(obj.Dependencies,'checkClassApi'), obj.Dependencies.checkClassApi(); end
                 obj.completeStage("Class API","Class API available.");
+                obj.startStage("IMU","Connecting IMU.");
                 obj.transition("CONNECTING_IMU","IMU",0,"Connecting IMU.");
                 obj.Imu=obj.Dependencies.createImu();
                 obj.IsConnected=true;
@@ -75,8 +82,9 @@ classdef BusDrivingSystemController < handle
             end
         end
         function runPreflight(obj)
-            obj.requireState(["CONNECTING_IMU","PREFLIGHT","STOPPED"]);
+            obj.requireOpen(); obj.requireState(["CONNECTING_IMU","PREFLIGHT","STOPPED"]);
             try
+                obj.startStage("Preflight","Running hardware preflight.");
                 obj.transition("PREFLIGHT","Preflight",0,"Running hardware preflight.");
                 obj.Preflight=obj.Dependencies.runPreflight(obj.Imu);
                 obj.TelemetryHub.updateMetadata(struct('preflight',obj.Preflight));
@@ -92,9 +100,10 @@ classdef BusDrivingSystemController < handle
             end
         end
         function startCalibration(obj)
-            obj.requireState(["CALIBRATION_REQUIRED","READY"]);
+            obj.requireOpen(); obj.requireState(["CALIBRATION_REQUIRED","READY"]);
             if obj.monitorActive(), error('IMU:SystemBusy','Stop real-time monitoring before calibration.'); end
             try
+                obj.startStage("Calibration","Calibration started by operator.");
                 obj.transition("CALIBRATING","Calibration",0,"Calibration started by operator.");
                 obj.CalibrationController=obj.Dependencies.createCalibrationController(obj.Imu);
                 obj.attachCalibrationCallbacks();
@@ -104,38 +113,54 @@ classdef BusDrivingSystemController < handle
             end
         end
         function confirmCurrentStep(obj)
+            obj.requireOpen();
             if isempty(obj.CalibrationController), return; end
             obj.logOperator("confirm","Operator confirmed the current calibration step.");
             obj.CalibrationController.confirmCurrentStep();
         end
         function rejectCurrentStep(obj)
+            obj.requireOpen();
             if isempty(obj.CalibrationController), return; end
             obj.logOperator("reject","Operator rejected the current calibration step.");
             obj.CalibrationController.rejectCurrentStep();
         end
         function startRealtime(obj)
-            obj.requireState(["READY","STOPPED"]);
+            obj.requireOpen(); obj.requireState(["READY","STOPPED"]);
             if obj.monitorActive(), error('IMU:RealtimeMonitorAlreadyRunning','A monitor is already active.'); end
             if isempty(obj.Calibration), obj.Calibration=obj.loadCalibration(); end
             try
+                obj.startStage("Realtime","Starting real-time monitor.");
                 obj.transition("STARTING_REALTIME","Realtime",0,"Starting real-time monitor.");
                 obj.RealtimeMonitor=obj.Dependencies.createRealtimeMonitor(obj.Imu,obj.Calibration);
                 obj.attachMonitorCallbacks(); obj.RealtimeMonitor.start();
+                obj.completeStage("Realtime","Real-time monitor started.");
                 obj.transition("STREAMING","Realtime",1,"Real-time monitoring active.");
+                obj.LastRuntimeTelemetryRefresh=-Inf;
+                status=obj.refreshRealtimeTelemetry();
+                if isstruct(status) && isfield(status,'recording') && ...
+                        isstruct(status.recording) && obj.field(status.recording,'enabled',false)
+                    obj.startStage("Recording","Recording active.");
+                end
             catch exception
                 obj.fail(exception); rethrow(exception);
             end
         end
         function summary=stopRealtime(obj)
+            obj.requireOpen();
             if isempty(obj.RealtimeMonitor), summary=[]; return; end
+            obj.startStage("Stopping","Stopping real-time monitor.");
             obj.transition("STOP_REQUESTED","Stopping",0,"Stop requested.");
             summary=obj.RealtimeMonitor.stop("operator_stop");
+            obj.completeStage("Recording","Recording finalized.");
+            obj.completeStage("Stopping","Real-time monitor stopped safely.");
             if ~obj.RealtimeMonitor.IsRunning
+                obj.startStage("Result","Finalizing operation result.");
                 obj.transition("STOPPED","Result",1,"Real-time monitor stopped.");
+                obj.completeStage("Result","Operation result finalized.");
             end
         end
         function runFullAcceptance(obj)
-            if obj.IsClosed, error('IMU:SystemControllerClosed','Closed controller cannot run acceptance.'); end
+            obj.requireOpen();
             if obj.AcceptanceRunning, error('IMU:AcceptanceAlreadyRunning','Hardware acceptance is already running.'); end
             allowed=["IDLE","READY","STOPPED","COMPLETED"];
             if obj.monitorActive() || obj.calibrationActive() || ~any(obj.State==allowed)
@@ -145,7 +170,8 @@ classdef BusDrivingSystemController < handle
             obj.AcceptanceRunning=true; acceptanceCleanup=onCleanup(@()obj.clearAcceptanceRunning());
             obj.transition("RUNNING_ACCEPTANCE","Hardware acceptance",0,"Hardware acceptance started.");
             try
-                options=struct('Observer',@(event)obj.onAcceptanceEvent(event));
+                options=struct('Observer',@(event)obj.onAcceptanceEvent(event), ...
+                    'Confirm',obj.Dependencies.confirmAcceptanceCalibration);
                 obj.AcceptanceResult=obj.Dependencies.runAcceptance(options);
                 obj.TelemetryHub.ingestAcceptanceResult(obj.AcceptanceResult);
                 if isstruct(obj.AcceptanceResult) && isfield(obj.AcceptanceResult,'success') && obj.AcceptanceResult.success
@@ -161,6 +187,7 @@ classdef BusDrivingSystemController < handle
             end
         end
         function cancel(obj)
+            obj.requireOpen();
             if ~isempty(obj.CalibrationController) && obj.CalibrationController.IsRunning
                 obj.CalibrationController.cancel("operator_cancelled");
             elseif obj.monitorActive()
@@ -198,11 +225,27 @@ classdef BusDrivingSystemController < handle
             snapshot=obj.TelemetryHub.getSummarySnapshot();
             snapshot.actions=obj.actionModel();
         end
-        function delete(obj), obj.close(); end
+        function status=refreshRealtimeTelemetry(obj)
+            obj.requireOpen();
+            status=[]; if isempty(obj.RealtimeMonitor) || ~isvalid(obj.RealtimeMonitor), return; end
+            allowed=["STREAMING","STOP_REQUESTED","STOP_DEFERRED","STOPPING","QUIESCING", ...
+                "DRAINING_TAIL","FINAL_STATS","FINALIZING_EVENTS","FINALIZING_RECORDING", ...
+                "CLEARING_BUFFER","RELEASING_OWNER"];
+            if ~any(obj.State==allowed), return; end
+            nowValue=obj.monotonicElapsed(); minimumPeriod=1/obj.Options.dashboardConfig.refreshHz;
+            if nowValue-obj.LastRuntimeTelemetryRefresh<minimumPeriod, return; end
+            status=obj.RealtimeMonitor.getStatus(); obj.TelemetryHub.ingestMonitorStatus(status);
+            obj.LastRuntimeTelemetryRefresh=nowValue;
+            obj.RuntimeTelemetryRefreshCount=obj.RuntimeTelemetryRefreshCount+1;
+        end
+        function delete(obj)
+            try, obj.close(); catch, end
+        end
     end
     methods(Access=private)
         function clearAcceptanceRunning(obj), obj.AcceptanceRunning=false; end
         function checkCalibration(obj)
+            obj.startStage("Calibration","Checking installation calibration.");
             obj.transition("CALIBRATION_CHECK","Calibration",0,"Checking installation calibration.");
             obj.Calibration=obj.loadCalibration();
             if isempty(obj.Calibration)
@@ -210,7 +253,11 @@ classdef BusDrivingSystemController < handle
                 obj.transition("CALIBRATION_REQUIRED","Calibration",0,"Installation calibration is required.");
             else
                 obj.completeStage("Calibration","Installation calibration is available.");
+                obj.startStage("Verification","Validating installation calibration.");
+                obj.completeStage("Verification","Installation calibration validated.");
+                obj.startStage("Result","Finalizing system readiness.");
                 obj.transition("READY","Result",1,"System ready.");
+                obj.completeStage("Result","System ready.");
             end
         end
         function calibration=loadCalibration(obj)
@@ -232,6 +279,8 @@ classdef BusDrivingSystemController < handle
             obj.TelemetryHub.ingestCalibration(status);
             state=string(status.state);
             if contains(upper(state),"VERIF") || (isfield(status,'phase') && contains(upper(string(status.phase)),"VERIF"))
+                obj.completeStage("Calibration","Calibration samples collected.");
+                obj.startStage("Verification","Verifying installation calibration.");
                 target="CALIBRATION_VERIFYING"; stage="Verification";
             else, target="CALIBRATING"; stage="Calibration"; end
             obj.transition(target,stage,status.progress,string(status.message));
@@ -243,8 +292,12 @@ classdef BusDrivingSystemController < handle
                     'calibration',result.calibration));
             end
             obj.TelemetryHub.ingestCalibrationResult(result);
+            obj.completeStage("Calibration","Calibration completed.");
+            obj.startStage("Verification","Finalizing calibration verification.");
             obj.completeStage("Verification","Calibration verified.");
+            obj.startStage("Result","Finalizing system readiness.");
             obj.transition("READY","Result",1,"System ready.");
+            obj.completeStage("Result","System ready.");
         end
         function onCalibrationCancelled(obj,result)
             obj.TelemetryHub.ingestCalibrationResult(result);
@@ -307,9 +360,26 @@ classdef BusDrivingSystemController < handle
             obj.emit(obj.OnStageProgress,status); obj.emitTelemetry();
         end
         function completeStage(obj,stage,message)
+            stage=string(stage);
+            if ~any(obj.ActiveOperationStages==stage), return; end
             event=struct('timestamp',obj.nowUtc(),'type',"stage_completed",'stage',string(stage), ...
                 'state',"PASSED",'progress',1,'message',string(message),'payload',struct());
             obj.TelemetryHub.ingestStage(event); obj.emit(obj.OnStageCompleted,event);
+            obj.ActiveOperationStages(obj.ActiveOperationStages==stage)=[];
+        end
+        function startStage(obj,stage,message)
+            stage=string(stage); if obj.Mode~="operation" || any(obj.ActiveOperationStages==stage), return; end
+            event=struct('timestamp',obj.nowUtc(),'type',"stage_started",'stage',stage, ...
+                'state',"RUNNING",'progress',0,'message',string(message),'payload',struct());
+            obj.ActiveOperationStages(end+1,1)=stage;
+            obj.TelemetryHub.ingestStage(event); obj.emit(obj.OnStageStarted,event);
+        end
+        function failStage(obj,stage,exception)
+            stage=string(stage); if obj.Mode~="operation" || ~any(obj.ActiveOperationStages==stage), return; end
+            event=struct('timestamp',obj.nowUtc(),'type',"stage_failed",'stage',stage, ...
+                'state',"FAILED",'progress',obj.StageProgress,'message',string(exception.message), ...
+                'payload',struct('identifier',string(exception.identifier)));
+            obj.TelemetryHub.ingestStage(event); obj.ActiveOperationStages(obj.ActiveOperationStages==stage)=[];
         end
         function emitTelemetry(obj), obj.emit(obj.OnTelemetry,obj.TelemetryHub.getSnapshot()); end
         function emit(obj,callback,payload)
@@ -323,6 +393,7 @@ classdef BusDrivingSystemController < handle
                     strcmp(obj.LastError.identifier,exception.identifier) && strcmp(obj.LastError.message,exception.message)
                 return;
             end
+            obj.failStage(obj.CurrentStage,exception);
             obj.State="FAILED"; obj.CompletedAt=obj.nowUtc(); obj.Message=string(exception.message); obj.LastError=exception;
             status=obj.getStatus(); status.severity="error";
             obj.TelemetryHub.ingestError(exception); obj.TelemetryHub.ingestState(status);
@@ -331,11 +402,15 @@ classdef BusDrivingSystemController < handle
         function requireState(obj,allowed)
             if ~any(obj.State==allowed), error('IMU:InvalidSystemState','Action is not valid in state %s.',obj.State); end
         end
+        function requireOpen(obj)
+            if obj.IsClosed, error('IMU:SystemControllerClosed','Closed controller cannot perform this action.'); end
+        end
         function active=monitorActive(obj)
             active=false;
             if isempty(obj.RealtimeMonitor) || ~isvalid(obj.RealtimeMonitor), return; end
-            status=obj.RealtimeMonitor.getStatus();
-            active=obj.RealtimeMonitor.IsRunning || status.isStopping;
+            stopping=["STOP_REQUESTED","STOP_DEFERRED","STOPPING","QUIESCING","DRAINING_TAIL", ...
+                "FINAL_STATS","FINALIZING_EVENTS","FINALIZING_RECORDING","CLEARING_BUFFER","RELEASING_OWNER"];
+            active=obj.RealtimeMonitor.IsRunning || any(obj.State==stopping);
         end
         function active=calibrationActive(obj)
             active=false;
@@ -384,6 +459,8 @@ classdef BusDrivingSystemController < handle
             defaults.createTimer=@timer; defaults.runPreflight=@diagnoseImuBrick2UsingExistingConnection;
             defaults.runAcceptance=@runFullImuHardwareAcceptance; defaults.getCommit=@getImuAcceptanceCommit;
             defaults.nowUtc=@()datetime('now','TimeZone','UTC'); defaults.sleep=@pause;
+            defaults.monotonicClockStart=@tic; defaults.monotonicClockElapsed=@toc;
+            defaults.confirmAcceptanceCalibration=@confirmAcceptanceCalibration;
             defaults.loadCalibration=@()loadSystemCalibration(obj.Options.busId,obj.Options.calibrationDirectory,imuConfig.uid);
             defaults.checkClassApi=@()assertImuAcceptanceClassApi();
             dependencies=defaults; names=fieldnames(custom);
@@ -409,6 +486,12 @@ classdef BusDrivingSystemController < handle
             end
             obj.IsConnected=false;
         end
+        function value=monotonicElapsed(obj)
+            value=double(obj.Dependencies.monotonicClockElapsed(obj.RuntimeTelemetryClock));
+        end
+        function value=field(~,s,name,default)
+            value=default; if isstruct(s) && isfield(s,name), value=s.(name); end
+        end
         function clearOwnedCallbacks(obj)
             if ~isempty(obj.RealtimeMonitor) && isvalid(obj.RealtimeMonitor)
                 names={'OnLifecycleChanged','OnSample','OnEventStarted','OnEventCompleted','OnWarning','OnError','OnStopped'};
@@ -420,6 +503,11 @@ classdef BusDrivingSystemController < handle
             end
         end
     end
+end
+
+function confirmed=confirmAcceptanceCalibration(prompt)
+answer=questdlg(char(prompt),'Hardware acceptance calibration','Confirm','Cancel','Cancel');
+confirmed=strcmp(answer,'Confirm');
 end
 
 function calibration=loadSystemCalibration(busId,directory,uid)

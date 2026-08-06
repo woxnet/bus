@@ -23,6 +23,7 @@ combined=struct('success',false,'generatedAt',datetime('now','TimeZone','UTC'), 
     'observerWarnings',strings(0,1));
 calibrationReport=[]; runtimeReport=[]; realtimeReport=[];
 childOptions=struct(); if isfield(options,'Observer'), childOptions.Observer=options.Observer; end
+if isfield(options,'Confirm'), childOptions.Confirm=options.Confirm; end
 try
     notify("stage_started","bootstrap","RUNNING",0,"Acceptance bootstrap started.",struct());
     api=dependencies.assertClassApi();

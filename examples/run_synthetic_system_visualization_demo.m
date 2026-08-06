@@ -4,11 +4,14 @@ function [syntheticController,syntheticDashboard,summary]=run_synthetic_system_v
 if nargin<1, showDashboard=true; end
 if nargin<2 || isempty(options), options=struct(); end
 waitForCompletion=isfield(options,'WaitForCompletion') && logical(options.WaitForCompletion);
+simulationSpeed=10; if isfield(options,'SimulationSpeed'), simulationSpeed=double(options.SimulationSpeed); end
 fprintf('SYNTHETIC DEMONSTRATION\nNOT A HARDWARE ACCEPTANCE\n');
 syntheticController=SyntheticBusDrivingSystemController();
-syntheticDashboard=BusDrivingSystemDashboard(syntheticController);
+dashboardDependencies=struct();
+if isfield(options,'DashboardDependencies'), dashboardDependencies=options.DashboardDependencies; end
+syntheticDashboard=BusDrivingSystemDashboard(syntheticController,[],dashboardDependencies);
 if showDashboard, syntheticDashboard.open(); end
-syntheticController.startSimulation(60,10);
+syntheticController.startSimulation(60,simulationSpeed);
 summary=[];
 if waitForCompletion
     syntheticController.waitForCompletion(10); summary=syntheticController.getSimulationSummary();

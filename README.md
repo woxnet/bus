@@ -309,6 +309,15 @@ above 10 Hz). Signal history defaults to 30 seconds, while completed events,
 log rows, and stage history are capped at 500, 1000, and 100 entries. Snapshot
 export writes MAT, JSON, and PNG artifacts without pausing acquisition.
 
+During streaming and safe stop, the dashboard asks the controller for a
+rate-limited monitor-status refresh at the same configured refresh frequency.
+This updates FIFO/callback age, data-quality, and recorder counters without
+reading or draining the FIFO and without adding work to the sample callback.
+`DashboardConfig` is shared by the telemetry hub and dashboard; optional
+`DashboardDependencies` are reserved for UI integration and deterministic
+tests. Hardware acceptance forwards calibration and verification progress into
+the unified dashboard and suppresses the legacy calibration window.
+
 The dashboard is not a data source, does not read or drain the callback FIFO,
 and does not apply calibration, filtering, or event detection. A dashboard or
 user-callback failure is isolated from acquisition. `RealtimeDrivingMonitor`

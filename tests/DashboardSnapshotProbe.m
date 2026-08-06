@@ -4,6 +4,8 @@ classdef DashboardSnapshotProbe < handle
         FullSnapshotCalls=0
         SummarySnapshotCalls=0
         Closed=false
+        FailNextFullSnapshots=0
+        RuntimeTelemetryRefreshCount=0
     end
     methods
         function obj=DashboardSnapshotProbe(config)
@@ -15,7 +17,12 @@ classdef DashboardSnapshotProbe < handle
             status=obj.getStatus(); value.actions=status.actions;
         end
         function value=getTelemetrySnapshot(obj)
-            obj.FullSnapshotCalls=obj.FullSnapshotCalls+1; value=obj.TelemetryHub.getSnapshot();
+            obj.FullSnapshotCalls=obj.FullSnapshotCalls+1;
+            if obj.FailNextFullSnapshots>0
+                obj.FailNextFullSnapshots=obj.FailNextFullSnapshots-1;
+                error('Test:SnapshotFailure','Injected snapshot failure.');
+            end
+            value=obj.TelemetryHub.getSnapshot();
         end
         function value=getStatus(obj)
             actions=struct('canStartSystem',true,'canRunPreflight',false,'canStartCalibration',false, ...
@@ -34,5 +41,8 @@ classdef DashboardSnapshotProbe < handle
         function startRealtime(~), end
         function stopRealtime(~), end
         function runFullAcceptance(~), end
+        function value=refreshRealtimeTelemetry(obj)
+            obj.RuntimeTelemetryRefreshCount=obj.RuntimeTelemetryRefreshCount+1; value=[];
+        end
     end
 end

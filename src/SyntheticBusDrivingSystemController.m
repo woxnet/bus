@@ -12,6 +12,7 @@ classdef SyntheticBusDrivingSystemController < handle
         TransitionHistory=strings(0,1)
         WarningHistory=strings(0,1)
         TimerErrors=strings(0,1)
+        RuntimeTelemetryRefreshCount=0
     end
     properties(Access=private)
         SimulationTimer=[]
@@ -20,6 +21,7 @@ classdef SyntheticBusDrivingSystemController < handle
         EventIndex=1
         AppliedTransitions=false(1,20)
         Summary
+        ActiveSyntheticEvent=[]
     end
     methods
         function obj=SyntheticBusDrivingSystemController(config)
@@ -68,6 +70,12 @@ classdef SyntheticBusDrivingSystemController < handle
         function snapshot=getSummarySnapshot(obj)
             snapshot=obj.TelemetryHub.getSummarySnapshot(); status=obj.getStatus(); snapshot.actions=status.actions;
         end
+        function status=refreshRealtimeTelemetry(obj)
+            status=[];
+            active=["STREAMING","STOP_DEFERRED","STOPPING","QUIESCING","DRAINING_TAIL", ...
+                "FINAL_STATS","FINALIZING_EVENTS","FINALIZING_RECORDING","CLEARING_BUFFER","RELEASING_OWNER"];
+            if any(obj.State==active), obj.RuntimeTelemetryRefreshCount=obj.RuntimeTelemetryRefreshCount+1; end
+        end
         function startSystem(obj), obj.setState("BOOTSTRAP","Bootstrap"); end
         function runPreflight(obj), obj.setState("PREFLIGHT","Preflight"); end
         function startCalibration(obj), obj.setState("CALIBRATING","Calibration"); end
@@ -86,6 +94,7 @@ classdef SyntheticBusDrivingSystemController < handle
         function resetSimulation(obj)
             obj.stopSimulationTimer(); obj.State="IDLE"; obj.CurrentStage=""; obj.SimulatedSeconds=0;
             obj.IsSimulationComplete=false; obj.NextSampleIndex=1; obj.EventIndex=1;
+            obj.ActiveSyntheticEvent=[]; obj.RuntimeTelemetryRefreshCount=0;
             obj.AppliedTransitions=false(1,20); obj.TransitionHistory=strings(0,1);
             obj.WarningHistory=strings(0,1); obj.TimerErrors=strings(0,1); obj.Summary=obj.makeSummary(false);
         end
@@ -150,14 +159,19 @@ classdef SyntheticBusDrivingSystemController < handle
             if obj.SimulatedSeconds<13, return; end
             target=floor(obj.SimulatedSeconds*100)+1;
             eventTypes=["BRAKING_CANDIDATE","TURN_LEFT_CANDIDATE","VERTICAL_SHOCK_CANDIDATE"];
-            eventTimes=[20 30 40];
+            eventTimes=[15 19 40];
             while obj.NextSampleIndex<=target
                 t=(obj.NextSampleIndex-1)/100;
                 obj.TelemetryHub.ingestSample(obj.sample(t,obj.NextSampleIndex));
-                if obj.EventIndex<=3 && t>=eventTimes(obj.EventIndex)
-                    event=obj.event(eventTypes(obj.EventIndex),t,obj.NextSampleIndex,obj.EventIndex);
-                    obj.TelemetryHub.ingestEventStarted(event); obj.TelemetryHub.ingestEventCompleted(event);
+                if ~isempty(obj.ActiveSyntheticEvent) && ...
+                        t>=obj.ActiveSyntheticEvent.startElapsedSeconds+obj.ActiveSyntheticEvent.durationSeconds
+                    completed=obj.ActiveSyntheticEvent;
+                    obj.TelemetryHub.ingestEventCompleted(completed); obj.ActiveSyntheticEvent=[];
                     obj.EventIndex=obj.EventIndex+1;
+                end
+                if isempty(obj.ActiveSyntheticEvent) && obj.EventIndex<=3 && t>=eventTimes(obj.EventIndex)
+                    event=obj.event(eventTypes(obj.EventIndex),t,obj.NextSampleIndex,obj.EventIndex);
+                    obj.ActiveSyntheticEvent=event; obj.TelemetryHub.ingestEventStarted(event);
                 end
                 obj.NextSampleIndex=obj.NextSampleIndex+1;
             end
@@ -217,8 +231,9 @@ classdef SyntheticBusDrivingSystemController < handle
                 'callbackAgeMs',4+20*double(t>=45),'effectiveFrequencyHz',50);
         end
         function e=event(~,type,t,k,index)
+            duration=2; if index==2, duration=25; end
             e=struct('eventId',"SYN-"+index,'type',type,'startTimestamp',t,'startElapsedSeconds',t, ...
-                'durationSeconds',1.2,'peakAcceleration',3+index,'peakJerk',7+index, ...
+                'durationSeconds',duration,'peakAcceleration',3+index,'peakJerk',7+index, ...
                 'peakYawRate',20+index,'sampleCount',120,'dataQuality',.9, ...
                 'terminationReason',"threshold",'status',"completed",'startSequence',uint64(k));
         end
