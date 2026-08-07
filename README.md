@@ -282,3 +282,74 @@ without reading the FIFO a second time. Stop a running instance with
 This mode is IMU-only: it does not determine speed, trip boundaries, traffic
 context, or whether a maneuver is caused by the driver or the road. It produces
 candidate events and data-quality diagnostics, not a driving-quality score.
+
+## Unified real-time system dashboard
+
+The unified operator dashboard covers bootstrap, class-API validation, IMU
+connection, preflight, installation calibration, verification, real-time
+monitoring, recording, safe stopping, and the final result in one window:
+
+```matlab
+run("startup.m");
+[systemController, systemDashboard] = runBusDrivingSystemDashboard();
+systemController.startSystem();
+```
+
+The dashboard has operation and hardware-acceptance modes. Its Overview,
+Signals, Events, Data quality, Calibration, Recording, Hardware acceptance,
+and Log tabs show system identity and lifecycle, raw and filtered signals,
+detector thresholds and candidate events, callback/FIFO counters, calibration
+and verification progress, recorder guards, acceptance reports, and operator
+actions. Calibration remains explicitly operator-started when the controller
+enters `CALIBRATION_REQUIRED`.
+
+Rendering is separated from telemetry ingest. Callback handlers only update
+bounded buffers; a fixed-spacing, drop-on-busy timer renders at 5 Hz (never
+above 10 Hz). Signal history defaults to 30 seconds, while completed events,
+log rows, and stage history are capped at 500, 1000, and 100 entries. Snapshot
+export writes MAT, JSON, and PNG artifacts without pausing acquisition.
+
+During streaming and safe stop, the dashboard asks the controller for a
+rate-limited monitor-status refresh at the same configured refresh frequency.
+This updates FIFO/callback age, data-quality, and recorder counters without
+reading or draining the FIFO and without adding work to the sample callback.
+`DashboardConfig` is shared by the telemetry hub and dashboard; optional
+`DashboardDependencies` are reserved for UI integration and deterministic
+tests. Hardware acceptance forwards calibration and verification progress into
+the unified dashboard and suppresses the legacy calibration window.
+
+The dashboard is not a data source, does not read or drain the callback FIFO,
+and does not apply calibration, filtering, or event detection. A dashboard or
+user-callback failure is isolated from acquisition. `RealtimeDrivingMonitor`
+remains the sole FIFO consumer. Displayed driving events are diagnostic
+candidates, not a driver score or a disciplinary conclusion.
+
+Each operation or hardware-acceptance execution has a distinct `runId`,
+sequence number, mode, and UTC start time. Starting a new run atomically clears
+run-scoped signals, events, stages, calibration progress, recorder/callback
+status, acceptance results, warnings, and errors. The dashboard detects the new
+`runId` and clears old plots and tables before rendering the new run.
+
+Start the hardware-free demonstration asynchronously with:
+
+```matlab
+[syntheticController, syntheticDashboard] = ...
+    run_synthetic_system_visualization_demo();
+```
+
+This returns immediately while the fixed-spacing simulation timer continues.
+For a blocking run with a completed summary, use:
+
+```matlab
+[syntheticController, syntheticDashboard, summary] = ...
+    run_synthetic_system_visualization_demo(true, ...
+        struct("WaitForCompletion", true));
+% Or: summary = runSyntheticSystemVisualizationDemoBlocking();
+```
+
+It is labelled `SYNTHETIC DEMONSTRATION — NOT A HARDWARE ACCEPTANCE` and
+simulates 60 seconds containing calibration, verification, braking, turn and
+vertical-shock candidates, degraded data, a recording guard, safe stop, and a
+completed acceptance. The desktop-only visual smoke test is intentionally not
+part of normal CI and can be run manually with
+`runSystemDashboardVisualSmokeTest`.

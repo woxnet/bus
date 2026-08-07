@@ -29,6 +29,7 @@ classdef RealtimeDrivingMonitor < handle
         OnWarning=[]
         OnError=[]
         OnStopped=[]
+        OnLifecycleChanged=[]
     end
     properties(Access=private)
         Imu
@@ -78,6 +79,9 @@ classdef RealtimeDrivingMonitor < handle
         DeferredStopRequested=false
         DeferredStopReason=""
         LastRecordingStorageGuardSeconds=-Inf
+        LifecycleState="IDLE"
+        LastCallbackStats=[]
+        LastFreeDiskBytes=NaN
     end
 
     methods
@@ -105,13 +109,16 @@ classdef RealtimeDrivingMonitor < handle
                 error('IMU:RealtimeMonitorAlreadyRunning','Monitor is running.');
             end
             try
+                obj.setLifecycle("STARTING");
                 guard=obj.Dependencies.assertRuntimeReady; guard();
                 obj.validateStartInputs(); obj.reset();
                 clockStart=obj.Dependencies.monotonicClockStart;
                 obj.MonitorClock=clockStart();
                 if ismethod(obj.Imu,'claimStreamOwner'), obj.Imu.claimStreamOwner("RealtimeDrivingMonitor"); end
+                obj.setLifecycle("STREAM_CLAIMED");
                 obj.Imu.start(obj.Config.callbackPeriodMs);
                 stats=obj.Imu.getCallbackStats();
+                obj.LastCallbackStats=stats;
                 obj.StreamSessionId=uint64(stats.sessionId);
                 obj.StartedAt=datetime('now','TimeZone','UTC');
                 if obj.Config.enableRecording
@@ -135,10 +142,12 @@ classdef RealtimeDrivingMonitor < handle
                         'TimerFcn',@(~,~)obj.timerPoll());
                 end
                 obj.IsRunning=true;
+                obj.setLifecycle("STREAMING");
                 if obj.Config.UseTimer, start(obj.Timer); end
                 obj.evaluateRecordingGuards();
                 if obj.FatalStopRequested, obj.stop(obj.StopReason); end
             catch exception
+                obj.setLifecycle("FAILED");
                 obj.rollbackStart();
                 obj.recordInternalError(exception);
                 rethrow(exception);
@@ -186,6 +195,7 @@ classdef RealtimeDrivingMonitor < handle
                     obj.DeferredStopReason=reason;
                 end
                 obj.StopReason=obj.DeferredStopReason;
+                obj.setLifecycle("STOP_DEFERRED");
                 summary=obj.makeSummary([],0,0,false);
                 return;
             end
@@ -199,6 +209,7 @@ classdef RealtimeDrivingMonitor < handle
             end
             obj.StopReason=reason;
             obj.IsStopping=true;
+            obj.setLifecycle("STOPPING");
             safety=onCleanup(@()obj.forceStoppedState());
             tailSamples=0; drainDuration=0; drainTimedOut=false; recording=[];
             try
@@ -212,18 +223,21 @@ classdef RealtimeDrivingMonitor < handle
                 obj.recordInternalError(exception);
             end
             try
+                obj.setLifecycle("QUIESCING");
                 obj.Imu.quiesce();
                 obj.AcquisitionDurationSeconds=obj.monotonicElapsed();
             catch exception
                 obj.recordInternalError(exception);
             end
             try
+                obj.setLifecycle("DRAINING_TAIL");
                 [tailSamples,drainDuration,drainTimedOut]=obj.drainTail();
             catch exception
                 drainTimedOut=true; obj.recordInternalError(exception);
             end
             finalStats=[];
             try
+                obj.setLifecycle("FINAL_STATS");
                 finalStats=obj.Imu.getCallbackStats();
                 obj.FinalCallbackStats=finalStats;
                 obj.observeCallbackStats(finalStats);
@@ -231,12 +245,14 @@ classdef RealtimeDrivingMonitor < handle
                 obj.recordInternalError(exception);
             end
             try
+                obj.setLifecycle("FINALIZING_EVENTS");
                 obj.finishActiveEvents("monitor_stop",0); obj.flushPendingEvents();
             catch exception
                 obj.recordInternalError(exception);
             end
             if obj.OwnsRecorder && ~isempty(obj.Recorder) && obj.Recorder.IsRecording
                 try
+                    obj.setLifecycle("FINALIZING_RECORDING");
                     recording=obj.Recorder.stopExternal(finalStats,obj.RecordingFinalStatus,obj.StopReason);
                 catch exception
                     obj.recordInternalError(exception);
@@ -248,11 +264,13 @@ classdef RealtimeDrivingMonitor < handle
                 end
             end
             try
+                obj.setLifecycle("CLEARING_BUFFER");
                 obj.Imu.clearCallbackBuffer();
             catch exception
                 obj.recordInternalError(exception);
             end
             try
+                obj.setLifecycle("RELEASING_OWNER");
                 if ismethod(obj.Imu,'releaseStreamOwner')
                     obj.Imu.releaseStreamOwner("RealtimeDrivingMonitor");
                 end
@@ -272,6 +290,7 @@ classdef RealtimeDrivingMonitor < handle
             obj.StoppedAt=datetime('now','TimeZone','UTC'); obj.IsRunning=false;
             summary=obj.makeSummary(recording,tailSamples,drainDuration,drainTimedOut);
             obj.LastStopSummary=summary; obj.IsStopping=false; clear safety;
+            obj.setLifecycle("STOPPED");
             if ~obj.StoppedCallbackInvoked
                 obj.StoppedCallbackInvoked=true; obj.invokeCallback(obj.OnStopped,summary);
             end
@@ -299,6 +318,8 @@ classdef RealtimeDrivingMonitor < handle
             obj.FatalStopRequested=false;
             obj.BatchProcessing=false; obj.DeferredStopRequested=false;
             obj.DeferredStopReason=""; obj.LastRecordingStorageGuardSeconds=-Inf;
+            obj.LastCallbackStats=[];
+            obj.LastFreeDiskBytes=NaN;
             obj.Recorder=[]; obj.OwnsRecorder=false; obj.Dashboard=[]; obj.Timer=[];
             obj.resetProcessingState(); obj.PendingEvents=cell(5,1);
             sampleCapacity=max(1,ceil(obj.Config.historySeconds*obj.Config.sampleRateHz));
@@ -325,6 +346,75 @@ classdef RealtimeDrivingMonitor < handle
             else
                 stats=obj.makeSummary([],0,0,false);
             end
+        end
+        function status=getStatus(obj)
+            stats=obj.getStats(); callbackStats=obj.LastCallbackStats;
+            activeCells=cell(0,1);
+            states={obj.BrakingState,obj.AccelerationState,obj.LeftTurnState, ...
+                obj.RightTurnState,obj.VerticalShockState};
+            for index=1:numel(states)
+                preview=states{index}.getPreview();
+                if ~isempty(preview), activeCells{end+1,1}=preview; end %#ok<AGROW>
+            end
+            if isempty(activeCells), active=struct.empty(0,1); else, active=vertcat(activeCells{:}); end
+            recording=struct('enabled',obj.Config.enableRecording,'status',"disabled", ...
+                'sessionId',"",'directory',"",'samplesWritten',0,'bytesWritten',0, ...
+                'estimatedBufferedBytes',0,'maximumSessionBytes',obj.Config.maximumSessionBytes, ...
+                'minimumFreeDiskBytes',obj.Config.minimumFreeDiskBytes, ...
+                'freeDiskBytes',obj.LastFreeDiskBytes,'durationSeconds',stats.acquisitionDurationSeconds, ...
+                'maximumDurationSeconds',obj.Config.maximumRecordingDurationSeconds, ...
+                'stopReason',obj.StopReason);
+            if ~isempty(obj.Recorder)
+                if isprop(obj.Recorder,'IsRecording') && obj.Recorder.IsRecording
+                    recording.status="recording";
+                else
+                    recording.status="stopped";
+                end
+                if isprop(obj.Recorder,'SessionId'), recording.sessionId=obj.Recorder.SessionId; end
+                if isprop(obj.Recorder,'WorkingDirectory'), recording.directory=obj.Recorder.WorkingDirectory; end
+                if isprop(obj.Recorder,'SamplesWritten'), recording.samplesWritten=obj.Recorder.SamplesWritten; end
+                if isprop(obj.Recorder,'AppendedCount'), recording.samplesWritten=obj.Recorder.AppendedCount; end
+                if isprop(obj.Recorder,'BytesWritten'), recording.bytesWritten=obj.Recorder.BytesWritten; end
+                if isprop(obj.Recorder,'EstimatedBufferedBytes'), recording.estimatedBufferedBytes=obj.Recorder.EstimatedBufferedBytes; end
+            elseif obj.Config.enableRecording
+                recording.status="pending";
+            end
+            status=struct('lifecycleState',obj.LifecycleState, ...
+                'isRunning',obj.IsRunning,'isStopping',obj.IsStopping, ...
+                'batchProcessing',obj.BatchProcessing,'streamSessionId',obj.StreamSessionId, ...
+                'streamOwner',"none",'samplesProcessed',obj.SamplesProcessed, ...
+                'eventsDetected',obj.EventsDetected,'activeEvents',active, ...
+                'latestEvent',obj.LatestEvent,'callbackStats',callbackStats, ...
+                'dataQuality',struct('missingSamples',obj.MissingSamples, ...
+                    'duplicateSamples',obj.DuplicateSamples,'invalidSamples',obj.InvalidSamples, ...
+                    'lateSamples',obj.LateSamples,'overflowDropped',obj.OverflowDropped, ...
+                    'staleSessionDropped',obj.StaleSessionDropped, ...
+                    'maximumCallbackAgeMs',obj.MaximumCallbackAgeMs), ...
+                'recording',recording,'stopReason',obj.StopReason, ...
+                'acquisitionDurationSeconds',stats.acquisitionDurationSeconds, ...
+                'shutdownDurationSeconds',stats.shutdownDurationSeconds);
+            status.latestSensorSample=obj.LatestSensorSample;
+            status.latestVehicleSample=obj.LatestVehicleSample;
+            status.latestProcessedSample=obj.LatestProcessedSample;
+            status.currentCallbackAgeMs=0;
+            if isstruct(obj.LatestProcessedSample) && isfield(obj.LatestProcessedSample,'callbackAgeMs')
+                status.currentCallbackAgeMs=double(obj.LatestProcessedSample.callbackAgeMs);
+            end
+            status.maximumCallbackAgeMs=obj.MaximumCallbackAgeMs;
+            status.freeDiskBytes=obj.LastFreeDiskBytes;
+            status.durationSeconds=stats.acquisitionDurationSeconds;
+            status.bytesWritten=recording.bytesWritten;
+            status.estimatedBufferedBytes=recording.estimatedBufferedBytes;
+            status.bufferCapacity=0; status.bufferUtilization=0;
+            if isstruct(callbackStats)
+                if isfield(callbackStats,'capacity'), status.bufferCapacity=double(callbackStats.capacity); end
+                if status.bufferCapacity>0 && isfield(callbackStats,'buffered')
+                    status.bufferUtilization=double(callbackStats.buffered)/status.bufferCapacity;
+                end
+            end
+            try
+                if isprop(obj.Imu,'StreamOwner'), status.streamOwner=string(obj.Imu.StreamOwner); end
+            catch, end
         end
         function delete(obj)
             try
@@ -401,6 +491,7 @@ classdef RealtimeDrivingMonitor < handle
             obj.VerticalCalmSamples=0;
         end
         function overflow=observeCallbackStats(obj,stats)
+            obj.LastCallbackStats=stats;
             overflow=double(stats.overflowDropped)>obj.OverflowDropped;
             if overflow
                 increment=double(stats.overflowDropped)-obj.OverflowDropped;
@@ -711,6 +802,7 @@ classdef RealtimeDrivingMonitor < handle
                     obj.Config.recordingGuardPeriodSeconds
                 obj.LastRecordingStorageGuardSeconds=elapsed;
                 freeBytes=obj.Dependencies.getFreeDiskBytes(obj.Config.recordingDirectory);
+                obj.LastFreeDiskBytes=freeBytes;
                 if freeBytes<obj.Config.minimumFreeDiskBytes
                     reason="minimum_free_disk"; message="Minimum free disk reserve reached.";
                 elseif ismethod(obj.Recorder,'getSessionBytes') && ...
@@ -739,6 +831,12 @@ classdef RealtimeDrivingMonitor < handle
                 obj.LastError=exception;
                 warning('IMU:RealtimeUserCallbackFailed','User callback failed: %s',exception.message);
             end
+        end
+        function setLifecycle(obj,state)
+            state=string(state);
+            if obj.LifecycleState==state, return; end
+            obj.LifecycleState=state;
+            obj.invokeCallback(obj.OnLifecycleChanged,obj.getStatus());
         end
         function rollbackStart(obj)
             obj.cleanupAction(@()obj.stopTimer(),"timer rollback");
