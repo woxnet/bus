@@ -36,6 +36,22 @@ classdef FakeSystemMonitor < handle
             obj.IsRunning=false; obj.lifecycle("STOPPED"); summary=struct('success',true,'stopReason',"operator_stop");
             if ~isempty(obj.OnStopped), obj.OnStopped(obj,summary); end
         end
+        function triggerAutonomousStop(obj,reason)
+            obj.RecordingStopReason=string(reason);
+            for state=["STOP_DEFERRED","STOPPING","QUIESCING","DRAINING_TAIL","FINAL_STATS", ...
+                    "FINALIZING_EVENTS","FINALIZING_RECORDING","CLEARING_BUFFER","RELEASING_OWNER"]
+                obj.lifecycle(state);
+            end
+            obj.IsRunning=false;
+            obj.lifecycle("STOPPED");
+            summary=struct('success',true,'stopReason',string(reason));
+            if ~isempty(obj.OnStopped), obj.OnStopped(obj,summary); end
+        end
+        function triggerFailure(obj,reason)
+            obj.RecordingStopReason=string(reason);
+            obj.IsRunning=false;
+            obj.lifecycle("FAILED");
+        end
         function status=getStatus(obj)
             obj.StatusCalls=obj.StatusCalls+1;
             lifecycle="STOPPED"; if obj.IsRunning, lifecycle="STREAMING"; end

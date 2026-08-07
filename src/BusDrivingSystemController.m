@@ -46,6 +46,10 @@ classdef BusDrivingSystemController < handle
         Preflight=[]
         RuntimeTelemetryClock=[]
         ActiveOperationStages=strings(0,1)
+        RealtimeStoppingStarted=false
+        RealtimeStopFinalized=false
+        RealtimeStoppedEmitted=false
+        RealtimeStopSummary=[]
     end
     methods
         function obj=BusDrivingSystemController(options,dependencies)
@@ -141,6 +145,10 @@ classdef BusDrivingSystemController < handle
             if obj.monitorActive(), error('IMU:RealtimeMonitorAlreadyRunning','A monitor is already active.'); end
             if isempty(obj.Calibration), obj.Calibration=obj.loadCalibration(); end
             try
+                obj.RealtimeStoppingStarted=false;
+                obj.RealtimeStopFinalized=false;
+                obj.RealtimeStoppedEmitted=false;
+                obj.RealtimeStopSummary=[];
                 obj.startStage("Realtime","Starting real-time monitor.");
                 obj.transition("STARTING_REALTIME","Realtime",0,"Starting real-time monitor.");
                 obj.RealtimeMonitor=obj.Dependencies.createRealtimeMonitor(obj.Imu,obj.Calibration);
@@ -162,17 +170,11 @@ classdef BusDrivingSystemController < handle
         function summary=stopRealtime(obj)
             obj.requireOpen();
             if isempty(obj.RealtimeMonitor), summary=[]; return; end
-            obj.startStage("Stopping","Stopping real-time monitor.");
+            if obj.RealtimeStopFinalized, summary=obj.RealtimeStopSummary; return; end
+            obj.ensureRealtimeStoppingStarted("Stop requested.");
             obj.transition("STOP_REQUESTED","Stopping",0,"Stop requested.");
             summary=obj.RealtimeMonitor.stop("operator_stop");
-            obj.completeStage("Recording","Recording finalized.");
-            obj.completeStage("Realtime","Real-time monitoring completed.");
-            obj.completeStage("Stopping","Real-time monitor stopped safely.");
-            if ~obj.RealtimeMonitor.IsRunning
-                obj.startStage("Result","Finalizing operation result.");
-                obj.transition("STOPPED","Result",1,"Real-time monitor stopped.");
-                obj.completeStage("Result","Operation result finalized.");
-            end
+            if ~obj.RealtimeMonitor.IsRunning, obj.finalizeRealtimeStop(summary); end
         end
         function runFullAcceptance(obj)
             obj.requireOpen();
@@ -181,6 +183,7 @@ classdef BusDrivingSystemController < handle
             if obj.monitorActive() || obj.calibrationActive() || ~any(obj.State==allowed)
                 error('IMU:SystemBusy','Controller state %s cannot run hardware acceptance.',obj.State);
             end
+            obj.prepareForHardwareAcceptance();
             obj.beginRun("acceptance"); obj.AcceptanceResult=[];
             obj.AcceptanceRunning=true; acceptanceCleanup=onCleanup(@()obj.clearAcceptanceRunning());
             obj.transition("RUNNING_ACCEPTANCE","Hardware acceptance",0,"Hardware acceptance started.");
@@ -264,9 +267,10 @@ classdef BusDrivingSystemController < handle
             obj.transition("CALIBRATION_CHECK","Calibration",0,"Checking installation calibration.");
             obj.Calibration=obj.loadCalibration();
             if isempty(obj.Calibration)
-                obj.TelemetryHub.ingestCalibration(struct('state',"REQUIRED",'progress',0));
+                obj.TelemetryHub.ingestCalibration(struct('required',true,'state',"REQUIRED",'progress',0));
                 obj.transition("CALIBRATION_REQUIRED","Calibration",0,"Installation calibration is required.");
             else
+                obj.TelemetryHub.ingestCalibration(struct('required',false,'state',"READY",'progress',1));
                 obj.completeStage("Calibration","Installation calibration is available.");
                 obj.startStage("Verification","Validating installation calibration.");
                 obj.completeStage("Verification","Installation calibration validated.");
@@ -303,9 +307,10 @@ classdef BusDrivingSystemController < handle
         function onCalibrationCompleted(obj,result)
             if isfield(result,'calibration')
                 obj.Calibration=result.calibration;
-                obj.TelemetryHub.ingestCalibration(struct('state',"READY",'progress',1, ...
-                    'calibration',result.calibration));
             end
+            calibrationStatus=struct('required',false,'state',"READY",'progress',1);
+            if isfield(result,'calibration'), calibrationStatus.calibration=result.calibration; end
+            obj.TelemetryHub.ingestCalibration(calibrationStatus);
             obj.TelemetryHub.ingestCalibrationResult(result);
             obj.completeStage("Calibration","Calibration completed.");
             obj.startStage("Verification","Finalizing calibration verification.");
@@ -334,12 +339,22 @@ classdef BusDrivingSystemController < handle
         function onMonitorLifecycle(obj,status)
             obj.TelemetryHub.ingestMonitorStatus(status);
             lifecycle=string(status.lifecycleState);
+            if obj.RealtimeStopFinalized, return; end
             known=["STARTING","STREAM_CLAIMED","STREAMING","STOP_DEFERRED","STOPPING", ...
                 "QUIESCING","DRAINING_TAIL","FINAL_STATS","FINALIZING_EVENTS", ...
                 "FINALIZING_RECORDING","CLEARING_BUFFER","RELEASING_OWNER","STOPPED","FAILED"];
-            if any(lifecycle==known)
-                stage="Stopping"; if any(lifecycle==["STARTING","STREAM_CLAIMED","STREAMING"]), stage="Realtime"; end
-                obj.transition(lifecycle,stage,obj.StageProgress,lifecycle);
+            if ~any(lifecycle==known), return; end
+            if any(lifecycle==["STOP_DEFERRED","STOPPING","QUIESCING","DRAINING_TAIL", ...
+                    "FINAL_STATS","FINALIZING_EVENTS","FINALIZING_RECORDING", ...
+                    "CLEARING_BUFFER","RELEASING_OWNER"])
+                obj.ensureRealtimeStoppingStarted(lifecycle);
+                obj.transition(lifecycle,"Stopping",obj.StageProgress,lifecycle);
+            elseif lifecycle=="STOPPED"
+                obj.finalizeRealtimeStop([]);
+            elseif lifecycle=="FAILED"
+                obj.finalizeRealtimeFailure(status);
+            else
+                obj.transition(lifecycle,"Realtime",obj.StageProgress,lifecycle);
             end
         end
         function forwardSample(obj,sample)
@@ -351,9 +366,54 @@ classdef BusDrivingSystemController < handle
         function forwardError(obj,value), obj.TelemetryHub.ingestError(value); obj.emit(obj.OnError,value); end
         function forwardStopped(obj,summary)
             obj.TelemetryHub.ingestMonitorStatus(obj.RealtimeMonitor.getStatus());
-            obj.completeStage("Recording","Recording finalized.");
-            obj.completeStage("Realtime","Real-time monitoring completed.");
-            obj.emit(obj.OnStopped,summary);
+            obj.finalizeRealtimeStop(summary);
+        end
+        function ensureRealtimeStoppingStarted(obj,message)
+            if obj.RealtimeStoppingStarted || obj.RealtimeStopFinalized, return; end
+            obj.RealtimeStoppingStarted=true;
+            obj.startStage("Stopping",string(message));
+        end
+        function finalizeRealtimeStop(obj,summary)
+            if obj.State=="FAILED", return; end
+            if ~isempty(summary), obj.RealtimeStopSummary=summary; end
+            if ~obj.RealtimeStopFinalized
+                obj.ensureRealtimeStoppingStarted("Real-time monitor is stopping.");
+                obj.RealtimeStopFinalized=true;
+                obj.completeStage("Recording","Recording finalized.");
+                obj.completeStage("Realtime","Real-time monitoring completed.");
+                obj.completeStage("Stopping","Real-time monitor stopped safely.");
+                obj.startStage("Result","Finalizing operation result.");
+                obj.transition("STOPPED","Result",1,"Real-time monitor stopped.");
+                obj.completeStage("Result","Operation result finalized.");
+                obj.CompletedAt=obj.nowUtc();
+            end
+            if ~isempty(summary) && ~obj.RealtimeStoppedEmitted
+                obj.RealtimeStoppedEmitted=true;
+                obj.emit(obj.OnStopped,summary);
+            end
+        end
+        function finalizeRealtimeFailure(obj,status)
+            if obj.RealtimeStopFinalized, return; end
+            obj.ensureRealtimeStoppingStarted("Real-time monitor failed.");
+            obj.RealtimeStopFinalized=true;
+            reason=string(obj.field(status,'stopReason',obj.field(status,'message',"Real-time monitor failed.")));
+            if strlength(reason)==0, reason="Real-time monitor failed."; end
+            exception=MException('IMU:RealtimeMonitorFailed','%s',reason);
+            obj.failStage("Recording",exception);
+            obj.failStage("Realtime",exception);
+            obj.failStage("Stopping",exception);
+            obj.fail(exception);
+        end
+        function prepareForHardwareAcceptance(obj)
+            if obj.monitorActive() || obj.calibrationActive()
+                error('IMU:SystemBusy','Active operation hardware cannot be transferred to acceptance.');
+            end
+            obj.clearOwnedCallbacks();
+            obj.disconnectImu(true);
+            obj.RealtimeMonitor=[];
+            obj.CalibrationController=[];
+            obj.Imu=[];
+            obj.IsConnected=false;
         end
         function onAcceptanceEvent(obj,event)
             obj.TelemetryHub.ingestStage(event);
@@ -375,6 +435,12 @@ classdef BusDrivingSystemController < handle
             changed=obj.State~=string(state); obj.State=string(state); obj.CurrentStage=string(stage);
             obj.StageProgress=max(0,min(1,double(progress))); obj.Message=string(message);
             status=obj.getStatus(); obj.TelemetryHub.ingestState(status);
+            if obj.Mode=="operation" && any(obj.ActiveOperationStages==string(stage))
+                event=struct('timestamp',obj.nowUtc(),'type',"stage_progress",'stage',string(stage), ...
+                    'state',string(state),'progress',obj.StageProgress,'message',string(message), ...
+                    'payload',struct('source',"controller"));
+                obj.TelemetryHub.ingestStage(event);
+            end
             if changed, obj.emit(obj.OnStateChanged,status); end
             obj.emit(obj.OnStageProgress,status); obj.emitTelemetry();
         end
@@ -382,7 +448,8 @@ classdef BusDrivingSystemController < handle
             stage=string(stage);
             if ~any(obj.ActiveOperationStages==stage), return; end
             event=struct('timestamp',obj.nowUtc(),'type',"stage_completed",'stage',string(stage), ...
-                'state',"PASSED",'progress',1,'message',string(message),'payload',struct());
+                'state',"PASSED",'progress',1,'message',string(message), ...
+                'payload',struct('source',"controller"));
             obj.TelemetryHub.ingestStage(event); obj.emit(obj.OnStageCompleted,event);
             obj.ActiveOperationStages(obj.ActiveOperationStages==stage)=[];
         end
@@ -390,14 +457,15 @@ classdef BusDrivingSystemController < handle
             stage=string(stage); if obj.Mode~="operation" || ~any(obj.ActiveOperationStages==stage), return; end
             event=struct('timestamp',obj.nowUtc(),'type',"stage_cancelled",'stage',stage, ...
                 'state',"CANCELLED",'progress',obj.StageProgress,'message',string(reason), ...
-                'payload',struct('cancelReason',string(reason)),'runId',obj.RunId);
+                'payload',struct('cancelReason',string(reason),'source',"controller"),'runId',obj.RunId);
             obj.TelemetryHub.ingestStage(event); obj.emit(obj.OnStageCompleted,event);
             obj.ActiveOperationStages(obj.ActiveOperationStages==stage)=[];
         end
         function startStage(obj,stage,message)
             stage=string(stage); if obj.Mode~="operation" || any(obj.ActiveOperationStages==stage), return; end
             event=struct('timestamp',obj.nowUtc(),'type',"stage_started",'stage',stage, ...
-                'state',"RUNNING",'progress',0,'message',string(message),'payload',struct());
+                'state',"RUNNING",'progress',0,'message',string(message), ...
+                'payload',struct('source',"controller"));
             obj.ActiveOperationStages(end+1,1)=stage;
             obj.TelemetryHub.ingestStage(event); obj.emit(obj.OnStageStarted,event);
         end
@@ -405,7 +473,7 @@ classdef BusDrivingSystemController < handle
             stage=string(stage); if obj.Mode~="operation" || ~any(obj.ActiveOperationStages==stage), return; end
             event=struct('timestamp',obj.nowUtc(),'type',"stage_failed",'stage',stage, ...
                 'state',"FAILED",'progress',obj.StageProgress,'message',string(exception.message), ...
-                'payload',struct('identifier',string(exception.identifier)));
+                'payload',struct('identifier',string(exception.identifier),'source',"controller"));
             obj.TelemetryHub.ingestStage(event); obj.ActiveOperationStages(obj.ActiveOperationStages==stage)=[];
         end
         function emitTelemetry(obj), obj.emit(obj.OnTelemetry,obj.TelemetryHub.getSnapshot()); end
@@ -514,12 +582,17 @@ classdef BusDrivingSystemController < handle
             controller=ImuInstallationCalibrationController(imu,obj.Options.busId, ...
                 obj.Options.calibrationDirectory,workflowOptions);
         end
-        function disconnectImu(obj)
+        function disconnectImu(obj,strict)
+            if nargin<2, strict=false; end
             if isempty(obj.Imu), obj.IsConnected=false; return; end
             try
                 if ismethod(obj.Imu,'disconnect'), obj.Imu.disconnect(); end
             catch exception
                 obj.TelemetryHub.ingestWarning(struct('type',"IMU_DISCONNECT_FAILED",'message',exception.message));
+                if strict
+                    obj.IsConnected=true;
+                    rethrow(exception);
+                end
             end
             obj.IsConnected=false;
         end

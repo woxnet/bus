@@ -6,6 +6,7 @@ classdef SystemControllerProbe < handle
         Monitor=[]
         CommitCalls=0
         Imus=FakeSystemImu.empty(0,1)
+        AcceptanceAction=[]
     end
     methods
         function dependencies=getDependencies(obj)
@@ -13,7 +14,7 @@ classdef SystemControllerProbe < handle
                 'createCalibrationController',@(~)obj.createCalibration(), ...
                 'createRealtimeMonitor',@(~,~)obj.createMonitor(), ...
                 'runPreflight',@(~)struct('success',true,'errors',strings(0,1)), ...
-                'runAcceptance',@(~)struct('success',true), ...
+                'runAcceptance',@(options)obj.runAcceptance(options), ...
                 'getCommit',@()obj.getCommit(), ...
                 'nowUtc',@()datetime('now','TimeZone','UTC'), ...
                 'loadCalibration',@()obj.loadCalibration(), ...
@@ -30,6 +31,10 @@ classdef SystemControllerProbe < handle
         function value=createImu(obj), value=FakeSystemImu(); obj.Imus(end+1,1)=value; end
         function value=getCommit(obj)
             obj.CommitCalls=obj.CommitCalls+1; value="0123456789012345678901234567890123456789";
+        end
+        function value=runAcceptance(obj,options)
+            if isempty(obj.AcceptanceAction), value=struct('success',true); return; end
+            value=obj.AcceptanceAction(options);
         end
     end
 end
